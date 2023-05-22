@@ -18,7 +18,7 @@ Feel free to customize and enhance the application further to suit your specific
 
 Happy coding!
 
-Sure! Here are step-by-step instructions on how to use the Password List Generator:
+Step-by-step instructions on how to use the Password List Generator:
 
 1. Clone the Repository:
    - Open your command-line interface (CLI) or terminal.
