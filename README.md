@@ -11,6 +11,7 @@ A modernized, GUI-based Password List Generator built with Python. Generate cust
   - Smart mutations from tokens (name, surname, city, birthdate, optional wordlist) with case/leet/suffix variations
 - Live progress with ETA, sample preview, and cancel support
 - Output to .txt or compressed .txt.gz
+- Optional Pentest mode: send candidates to a target login URL via GET/POST with rate limiting, success/failure detection, and optional basic SQL injection probes (for authorized testing only)
 - Save/Load profiles as JSON (legacy .pkl still loadable)
 - Safety caps and warnings to avoid unbounded generation
 
@@ -31,14 +32,21 @@ If you prefer not to install ttkbootstrap, the app will fall back to standard Tk
 python SoupSalad.py
 ```
 
+If you plan to use Pentest mode, install `requests`:
+
+```bash
+pip install requests
+```
+
 ## Usage
 
 1. Enter profile details (Name, Surname, City, Birthdate)
-2. Choose a mode (Brute-force or Smart mutations)
+2. Choose a mode (Brute-force, Smart brute-force, or Smart mutations)
 3. Set min/max lengths and optional special characters
-4. Choose an output file ("Browse…"). Enable "Gzip output" if desired
-5. Click "Generate" to start; use "Cancel" to stop
-6. Preview window shows sample candidates
+4. Optional: enable Pentest, fill target URL, method (GET/POST), username value, form parameter names, success codes/regex, failure regex, and QPS. Optionally enable SQLi checks and choose which field to test first
+5. If not using Pentest: choose an output file ("Browse…"). Enable "Gzip output" if desired
+6. Click "Run" to start; use "Cancel" to stop
+7. Preview/Log pane shows samples and request logs
 
 Notes:
 - Brute-force grows exponentially; the app warns/caps overly large runs
