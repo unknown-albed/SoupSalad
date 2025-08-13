@@ -97,7 +97,7 @@ class PasswordListGeneratorApp:
 
         # Mode
         ttk.Label(options, text="Mode").grid(row=0, column=0, sticky="e", padx=4, pady=4)
-        mode_combo = ttk.Combobox(options, textvariable=self.var_mode, values=["Brute-force", "Smart mutations"], state="readonly", width=18)
+        mode_combo = ttk.Combobox(options, textvariable=self.var_mode, values=["Brute-force", "Smart brute-force", "Smart mutations"], state="readonly", width=18)
         mode_combo.grid(row=0, column=1, sticky="w", padx=4, pady=4)
 
         # Lengths
@@ -269,6 +269,8 @@ class PasswordListGeneratorApp:
                 messagebox.showerror("Character set", "Character set is empty. Provide inputs or special characters.")
                 return
             total_est = self._geom_series(n, min_len, max_len)
+        elif mode == "Smart brute-force":
+            total_est = self._estimate_smart_bruteforce_total(min_len, max_len)
         else:
             total_est = self._estimate_smart_total(min_len, max_len)
 
@@ -412,6 +414,47 @@ class PasswordListGeneratorApp:
             return b - a + 1
         return (n ** (b + 1) - n ** a) // (n - 1)
 
+    def _estimate_smart_bruteforce_total(self, min_len: int, max_len: int) -> int:
+        # Build a reduced, context-aware charset: letters from inputs + digits (optional) + specials
+        charset = self._build_bruteforce_charset()
+        # Heuristic reduction: prioritize most common characters from inputs
+        # Cap character set to at most 12 most frequent to tame the explosion
+        if charset:
+            freq = {}
+            for ch in (self.var_name.get() + self.var_surname.get() + self.var_city.get() + self.var_birthdate.get() + self.var_special_chars.get()):
+                if not ch:
+                    continue
+                freq[ch] = freq.get(ch, 0) + 1
+            sorted_chars = [c for c, _ in sorted(freq.items(), key=lambda kv: kv[1], reverse=True)]
+            reduced = ''.join(sorted(set((sorted_chars + list(charset))) ) )
+            charset = ''.join(list(reduced)[:12])
+        n = len(charset)
+        return self._geom_series(n, min_len, max_len) if n > 0 else 0
+
+    def _smart_bruteforce_candidates(self, min_len: int, max_len: int):
+        # Build prioritized charset based on frequency in inputs; cap to 12 chars
+        base = self._build_bruteforce_charset()
+        if not base:
+            return
+        freq = {}
+        for ch in (self.var_name.get() + self.var_surname.get() + self.var_city.get() + self.var_birthdate.get() + self.var_special_chars.get()):
+            if not ch:
+                continue
+            freq[ch] = freq.get(ch, 0) + 1
+        prioritized = []
+        for c, _ in sorted(freq.items(), key=lambda kv: kv[1], reverse=True):
+            if c in base and c not in prioritized:
+                prioritized.append(c)
+            if len(prioritized) >= 12:
+                break
+        for c in base:
+            if c not in prioritized and len(prioritized) < 12:
+                prioritized.append(c)
+        charset = ''.join(prioritized)
+        for L in range(min_len, max_len + 1):
+            for tup in itertools.product(charset, repeat=L):
+                yield ''.join(tup)
+
     def _worker(self, args: dict) -> None:
         mode = args["mode"]
         min_len = args["min_len"]
@@ -454,6 +497,19 @@ class PasswordListGeneratorApp:
                         if completed % 5000 == 0:
                             elapsed = time.time() - start
                             self.ui_queue.put(("progress", completed, self.total_estimated, elapsed))
+            elif mode == "Smart brute-force":
+                self.total_estimated = self._estimate_smart_bruteforce_total(min_len, max_len)
+                for pwd in self._smart_bruteforce_candidates(min_len, max_len):
+                    if self.cancel_requested:
+                        break
+                    f.write(pwd + "\n")
+                    completed += 1
+                    if sample_sent < 50:
+                        self.ui_queue.put(("sample", pwd))
+                        sample_sent += 1
+                    if completed % 5000 == 0:
+                        elapsed = time.time() - start
+                        self.ui_queue.put(("progress", completed, max(self.total_estimated, completed), elapsed))
             else:
                 # Smart mutations
                 for pwd in self._smart_candidates(min_len, max_len):

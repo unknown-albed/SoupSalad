@@ -5,8 +5,9 @@ A modernized, GUI-based Password List Generator built with Python. Generate cust
 ## Highlights
 
 - Modern themed UI (uses ttkbootstrap when available)
-- Two generation modes:
+- Three generation modes:
   - Brute-force over a chosen character set and length range
+  - Smart brute-force (prioritized, reduced charset based on your inputs)
   - Smart mutations from tokens (name, surname, city, birthdate, optional wordlist) with case/leet/suffix variations
 - Live progress with ETA, sample preview, and cancel support
 - Output to .txt or compressed .txt.gz
