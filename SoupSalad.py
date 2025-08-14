@@ -110,6 +110,20 @@ class PasswordListGeneratorApp:
         self.var_proxy_url = tk.StringVar(value="")
         self.var_verify_tls = tk.BooleanVar(value=True)
         self.var_timeout = tk.DoubleVar(value=15.0)
+        # Usernames & spraying
+        self.var_usernames_file = tk.StringVar(value="")
+        self.var_usernames_count = tk.StringVar(value="(none)")
+        self.loaded_usernames: list[str] = []
+        self.var_generate_patterns = tk.BooleanVar(value=True)
+        self.var_email_domain = tk.StringVar(value="")
+        self.var_lowercase_usernames = tk.BooleanVar(value=True)
+        self.var_common_aliases = tk.BooleanVar(value=True)
+        self.var_spray_enabled = tk.BooleanVar(value=False)
+        self.var_spray_passwords_file = tk.StringVar(value="")
+        self.var_spray_cooldown_min = tk.DoubleVar(value=15.0)
+        self.var_spray_window_min = tk.DoubleVar(value=60.0)
+        self.var_spray_attempts_per_window = tk.IntVar(value=1)
+        self.var_spray_stop_on_success = tk.BooleanVar(value=True)
 
         # Build UI
         self._build_ui()
@@ -180,6 +194,32 @@ class PasswordListGeneratorApp:
         self._add_labeled_entry(target, "Timeout (s)", self.var_timeout, row=5, col=7)
         for i in range(0, 9):
             target.grid_columnconfigure(i, weight=1)
+
+        # Usernames & Spray controls
+        users = ttk.LabelFrame(main, text="Usernames & Password Spraying")
+        users.pack(fill=tk.X, **padding)
+        # Username file loader
+        ttk.Label(users, text="Usernames file (one per line)").grid(row=0, column=0, sticky="e", padx=4, pady=4)
+        ttk.Entry(users, textvariable=self.var_usernames_file).grid(row=0, column=1, sticky="we", padx=4, pady=4)
+        ttk.Button(users, text="Browse…", command=self.on_browse_usernames_file).grid(row=0, column=2, sticky="w", padx=4, pady=4)
+        ttk.Label(users, textvariable=self.var_usernames_count).grid(row=0, column=3, sticky="w", padx=4, pady=4)
+        # Username discovery options
+        ttk.Checkbutton(users, text="Generate patterns", variable=self.var_generate_patterns).grid(row=1, column=0, sticky="w", padx=4, pady=4)
+        ttk.Label(users, text="Email domain").grid(row=1, column=1, sticky="e", padx=4, pady=4)
+        ttk.Entry(users, textvariable=self.var_email_domain).grid(row=1, column=2, sticky="we", padx=4, pady=4)
+        ttk.Checkbutton(users, text="Lowercase usernames", variable=self.var_lowercase_usernames).grid(row=1, column=3, sticky="w", padx=4, pady=4)
+        ttk.Checkbutton(users, text="Include common aliases", variable=self.var_common_aliases).grid(row=1, column=4, sticky="w", padx=4, pady=4)
+        # Spray controls
+        ttk.Checkbutton(users, text="Enable Password Spraying", variable=self.var_spray_enabled).grid(row=2, column=0, sticky="w", padx=4, pady=4)
+        ttk.Label(users, text="Passwords file (one per line)").grid(row=2, column=1, sticky="e", padx=4, pady=4)
+        ttk.Entry(users, textvariable=self.var_spray_passwords_file).grid(row=2, column=2, sticky="we", padx=4, pady=4)
+        ttk.Button(users, text="Browse…", command=self.on_browse_passwords_file).grid(row=2, column=3, sticky="w", padx=4, pady=4)
+        self._add_labeled_entry(users, "Cooldown (min)", self.var_spray_cooldown_min, row=3, col=0)
+        self._add_labeled_entry(users, "Window (min)", self.var_spray_window_min, row=3, col=2)
+        self._add_labeled_spinbox(users, "Attempts/user/window", self.var_spray_attempts_per_window, row=3, col=4, from_=1, to=5)
+        ttk.Checkbutton(users, text="Stop on first success", variable=self.var_spray_stop_on_success).grid(row=3, column=6, sticky="w", padx=4, pady=4)
+        for i in range(0, 7):
+            users.grid_columnconfigure(i, weight=1)
 
         # Output selection
         out = ttk.LabelFrame(main, text="Output (ignored when Pentest is enabled)")
@@ -328,9 +368,6 @@ class PasswordListGeneratorApp:
                 messagebox.showerror("Target URL", "Please enter the target URL.")
                 return
             username = self.var_username_value.get().strip()
-            if not username:
-                messagebox.showerror("Username", "Please enter the username value to test.")
-                return
             user_param = self.var_user_param.get().strip() or "username"
             pass_param = self.var_pass_param.get().strip() or "password"
             success_codes = self._parse_codes(self.var_success_codes.get())
@@ -345,6 +382,29 @@ class PasswordListGeneratorApp:
             verify_tls = bool(self.var_verify_tls.get())
             timeout = float(self.var_timeout.get() or 15.0)
             concurrency = max(1, int(self.var_concurrency.get() or 5))
+            # Usernames collection
+            usernames = self._collect_usernames(username)
+            if not usernames:
+                messagebox.showerror("Usernames", "Provide a username value or a usernames file, or enable pattern generation.")
+                return
+            # Spray configuration
+            spray_enabled = bool(self.var_spray_enabled.get())
+            passwords = []
+            cooldown_min = float(self.var_spray_cooldown_min.get() or 15.0)
+            window_min = float(self.var_spray_window_min.get() or 60.0)
+            attempts_per_window = max(1, int(self.var_spray_attempts_per_window.get() or 1))
+            min_cooldown = max(0.1, window_min / attempts_per_window)
+            if spray_enabled:
+                if not self.var_spray_passwords_file.get().strip():
+                    messagebox.showerror("Spray passwords", "Please choose a passwords file for spraying (one per line).")
+                    return
+                passwords = self._parse_list_file(self.var_spray_passwords_file.get().strip())
+                if not passwords:
+                    messagebox.showerror("Spray passwords", "No passwords found in file.")
+                    return
+                if cooldown_min < min_cooldown:
+                    cooldown_min = min_cooldown
+                    self.ui_queue.put(("log", f"Cooldown increased to {cooldown_min} min to respect window policy ({attempts_per_window} attempts per {window_min} min)."))
             pentest_args = {
                 "enabled": True,
                 "url": url,
@@ -365,6 +425,12 @@ class PasswordListGeneratorApp:
                 "verify": verify_tls,
                 "timeout": timeout,
                 "concurrency": concurrency,
+                "usernames": usernames,
+                "spray_enabled": spray_enabled,
+                "spray_passwords": passwords,
+                "spray_cooldown_sec": float(cooldown_min) * 60.0,
+                "spray_stop_on_success": bool(self.var_spray_stop_on_success.get()),
+                "email_domain": self.var_email_domain.get().strip(),
             }
 
         mode = self.var_mode.get()
@@ -379,6 +445,10 @@ class PasswordListGeneratorApp:
             total_est = self._estimate_smart_bruteforce_total(min_len, max_len)
         else:
             total_est = self._estimate_smart_total(min_len, max_len)
+
+        # If spraying, override estimate to reflect usernames x passwords
+        if pentest_enabled and pentest_args.get("spray_enabled"):
+            total_est = len(pentest_args.get("usernames", [])) * len(pentest_args.get("spray_passwords", []))
 
         HARD_CAP = 25_000_000
         WARN_CAP = 5_000_000
@@ -471,6 +541,18 @@ class PasswordListGeneratorApp:
             "proxy_url": self.var_proxy_url.get(),
             "verify_tls": self.var_verify_tls.get(),
             "timeout": self.var_timeout.get(),
+            # Usernames & spraying
+            "usernames_file": self.var_usernames_file.get(),
+            "email_domain": self.var_email_domain.get(),
+            "generate_patterns": self.var_generate_patterns.get(),
+            "lowercase_usernames": self.var_lowercase_usernames.get(),
+            "common_aliases": self.var_common_aliases.get(),
+            "spray_enabled": self.var_spray_enabled.get(),
+            "spray_passwords_file": self.var_spray_passwords_file.get(),
+            "spray_cooldown_min": self.var_spray_cooldown_min.get(),
+            "spray_window_min": self.var_spray_window_min.get(),
+            "spray_attempts_per_window": self.var_spray_attempts_per_window.get(),
+            "spray_stop_on_success": self.var_spray_stop_on_success.get(),
         }
         path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("Profile JSON", "*.json"), ("All files", "*.*")])
         if not path:
@@ -529,6 +611,22 @@ class PasswordListGeneratorApp:
         self.var_proxy_url.set(profile.get("proxy_url", ""))
         self.var_verify_tls.set(bool(profile.get("verify_tls", True)))
         self.var_timeout.set(float(profile.get("timeout", 15.0)))
+
+        # usernames & spraying
+        self.var_usernames_file.set(profile.get("usernames_file", ""))
+        if self.var_usernames_file.get():
+            self.loaded_usernames = self._parse_list_file(self.var_usernames_file.get())
+            self.var_usernames_count.set(f"loaded: {len(self.loaded_usernames)}")
+        self.var_email_domain.set(profile.get("email_domain", ""))
+        self.var_generate_patterns.set(bool(profile.get("generate_patterns", True)))
+        self.var_lowercase_usernames.set(bool(profile.get("lowercase_usernames", True)))
+        self.var_common_aliases.set(bool(profile.get("common_aliases", True)))
+        self.var_spray_enabled.set(bool(profile.get("spray_enabled", False)))
+        self.var_spray_passwords_file.set(profile.get("spray_passwords_file", ""))
+        self.var_spray_cooldown_min.set(float(profile.get("spray_cooldown_min", 15.0)))
+        self.var_spray_window_min.set(float(profile.get("spray_window_min", 60.0)))
+        self.var_spray_attempts_per_window.set(int(profile.get("spray_attempts_per_window", 1)))
+        self.var_spray_stop_on_success.set(bool(profile.get("spray_stop_on_success", True)))
 
         self._info("Profile loaded")
 
@@ -673,36 +771,76 @@ class PasswordListGeneratorApp:
             self.ui_queue.put(("log", f"Worker crashed: {exc}"))
             self.ui_queue.put(("done", 0, "Failed"))
 
-    def _smart_tokens(self) -> list[str]:
-        tokens: list[str] = []
-        base_parts = [self.var_name.get(), self.var_surname.get(), self.var_city.get(), self.var_birthdate.get()]
-        for part in base_parts:
-            part = (part or "").strip()
-            if not part:
-                continue
-            for t in filter(None, itertools.chain.from_iterable([p.split(sep) for sep in [" ", "-", "_", ".", ",", "/"] for p in [part]])):
-                tokens.append(t)
-                if t.isdigit() and 2 <= len(t) <= 4:
-                    tokens.append(t)
-        wordlist_path = os.path.join(os.getcwd(), "wordlist.txt")
-        if os.path.exists(wordlist_path):
-            try:
-                with open(wordlist_path, "r", encoding="utf-8", errors="ignore") as wf:
-                    for i, line in enumerate(wf):
-                        if i >= 1000:
-                            break
-                        w = line.strip()
-                        if w:
-                            tokens.append(w)
-            except Exception:
-                pass
+    def _parse_list_file(self, path: str) -> list[str]:
+        try:
+            lines: list[str] = []
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    w = line.strip()
+                    if w:
+                        lines.append(w)
+            return lines
+        except Exception as exc:
+            self.ui_queue.put(("log", f"Failed to read list file {path}: {exc}"))
+            return []
+
+    def _collect_usernames(self, fallback_username: str) -> list[str]:
+        usernames: list[str] = []
+        # From single value
+        if fallback_username:
+            usernames.append(fallback_username)
+        # From loaded file
+        usernames.extend(self.loaded_usernames)
+        # From patterns
+        if self.var_generate_patterns.get():
+            patterns = self._generate_username_patterns()
+            usernames.extend(patterns)
+        # Common aliases
+        if self.var_common_aliases.get():
+            usernames.extend(["admin", "administrator", "user", "test", "guest", "root"])
+        # Deduplicate
+        clean = []
         seen = set()
-        deduped = []
-        for t in tokens:
-            if t not in seen:
-                seen.add(t)
-                deduped.append(t)
-        return deduped[:2000]
+        for u in usernames:
+            u2 = u.strip()
+            if not u2:
+                continue
+            if self.var_lowercase_usernames.get():
+                u2 = u2.lower()
+            if u2 not in seen:
+                seen.add(u2)
+                clean.append(u2)
+        return clean
+
+    def _generate_username_patterns(self) -> list[str]:
+        first = (self.var_name.get() or "").strip().split(" ")[0] if (self.var_name.get() or "").strip() else ""
+        last = (self.var_surname.get() or "").strip().split(" ")[-1] if (self.var_surname.get() or "").strip() else ""
+        if not first and not last:
+            return []
+        f = first[:1]
+        l = last[:1]
+        combos = set([
+            first + last,
+            first + "." + last,
+            f + last,
+            first + l,
+            f + last,
+            last + first,
+            last + "." + first,
+            first + "_" + last,
+            first + "-" + last,
+            last + "_" + first,
+            last + "-" + first,
+        ])
+        domain = (self.var_email_domain.get() or "").strip()
+        results: list[str] = []
+        for c in combos:
+            if not c:
+                continue
+            if domain:
+                results.append(f"{c}@{domain}")
+            results.append(c)
+        return results
 
     def _mutate_cases_and_leet(self, token: str) -> list[str]:
         variants = set()
@@ -953,102 +1091,119 @@ class PasswordListGeneratorApp:
             except Exception:
                 pass
 
-        # Prepare generator
-        if mode == 'Brute-force':
-            generator = self._bruteforce_stream(min_len, max_len)
-        elif mode == 'Smart brute-force':
-            generator = self._smart_bruteforce_candidates(min_len, max_len)
-        else:
-            generator = self._smart_candidates(min_len, max_len)
+        def run_batch(pair_iterable) -> bool:
+            # returns True if success found and stop
+            nonlocal completed, found_msg
+            q = queue.Queue(maxsize=2000)
+            stop_event = threading.Event()
+            progress_lock = threading.Lock()
 
-        # Shared structures
-        q = queue.Queue(maxsize=2000)
-        stop_event = threading.Event()
-        progress_lock = threading.Lock()
-
-        # Producer
-        def producer():
-            try:
-                for pwd in generator:
-                    if self.cancel_requested or stop_event.is_set():
-                        break
-                    try:
-                        q.put(pwd, timeout=0.5)
-                    except queue.Full:
+            def producer():
+                try:
+                    for pair in pair_iterable:
                         if self.cancel_requested or stop_event.is_set():
                             break
-                        continue
-            except Exception as exc:
-                self.ui_queue.put(("log", f"Producer error: {exc}"))
-            finally:
-                # Signal no more items
-                for _ in range(cfg['concurrency']):
+                        try:
+                            q.put(pair, timeout=0.5)
+                        except queue.Full:
+                            if self.cancel_requested or stop_event.is_set():
+                                break
+                            continue
+                except Exception as exc:
+                    self.ui_queue.put(("log", f"Producer error: {exc}"))
+                finally:
+                    for _ in range(cfg['concurrency']):
+                        try:
+                            q.put_nowait((None, None))
+                        except Exception:
+                            pass
+
+            def worker(worker_id: int):
+                nonlocal completed, found_msg
+                sess = requests.Session()
+                self._configure_session(sess, cfg)
+                try:
+                    while not self.cancel_requested and not stop_event.is_set():
+                        try:
+                            user, pwd = q.get(timeout=0.5)
+                        except queue.Empty:
+                            continue
+                        if user is None:
+                            break
+                        try:
+                            limiter.acquire()
+                            resp = self._http_attempt(sess, cfg, user, pwd)
+                            with progress_lock:
+                                completed += 1
+                                if completed % 100 == 0:
+                                    elapsed = time.time() - start
+                                    self.ui_queue.put(("progress", completed, max(total_ref, completed), elapsed))
+                                if completed <= 50:
+                                    self.ui_queue.put(("sample", f"TRY {user} : {pwd}"))
+                            if self._is_success(resp, cfg):
+                                found_msg = f"SUCCESS: {user} / {pwd}"
+                                self.ui_queue.put(("log", found_msg))
+                                stop_event.set()
+                                break
+                        except Exception as exc:
+                            self.ui_queue.put(("log", f"Worker {worker_id} error: {exc}"))
+                        finally:
+                            try:
+                                q.task_done()
+                            except Exception:
+                                pass
+                finally:
                     try:
-                        q.put_nowait(None)
+                        sess.close()
                     except Exception:
                         pass
 
-        # Worker function
-        def worker(worker_id: int):
-            nonlocal completed, found_msg
-            sess = requests.Session()
-            self._configure_session(sess, cfg)
+            threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(cfg['concurrency'])]
+            prod_thread = threading.Thread(target=producer, daemon=True)
+            prod_thread.start()
+            for t in threads:
+                t.start()
             try:
-                while not self.cancel_requested and not stop_event.is_set():
-                    try:
-                        item = q.get(timeout=0.5)
-                    except queue.Empty:
-                        continue
-                    if item is None:
-                        break
-                    pwd = item
-                    try:
-                        limiter.acquire()
-                        resp = self._http_attempt(sess, cfg, cfg['username'], pwd)
-                        with progress_lock:
-                            completed += 1
-                            if completed % 100 == 0:
-                                elapsed = time.time() - start
-                                self.ui_queue.put(("progress", completed, max(total_ref, completed), elapsed))
-                            if completed <= 50:
-                                self.ui_queue.put(("sample", f"TRY {cfg['username']} : {pwd}"))
-                        if self._is_success(resp, cfg):
-                            found_msg = f"SUCCESS: {cfg['username']} / {pwd}"
-                            self.ui_queue.put(("log", found_msg))
-                            stop_event.set()
-                            break
-                    except Exception as exc:
-                        self.ui_queue.put(("log", f"Worker {worker_id} error: {exc}"))
-                    finally:
-                        try:
-                            q.task_done()
-                        except Exception:
-                            pass
-            finally:
-                try:
-                    sess.close()
-                except Exception:
-                    pass
-
-        # Start threads
-        threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(cfg['concurrency'])]
-        prod_thread = threading.Thread(target=producer, daemon=True)
-        prod_thread.start()
-        for t in threads:
-            t.start()
-
-        # Wait for completion
-        try:
-            q.join()
-        except Exception:
-            pass
-        stop_event.set()
-        # Wait a short moment for workers to exit
-        for t in threads:
-            try:
-                t.join(timeout=1.0)
+                q.join()
             except Exception:
                 pass
+            stop_event.set()
+            for t in threads:
+                try:
+                    t.join(timeout=1.0)
+                except Exception:
+                    pass
+            return stop_event.is_set() and bool(found_msg)
+
+        # Build batches depending on spray setting
+        if cfg.get('spray_enabled'):
+            usernames = cfg.get('usernames', [])
+            for pwd in cfg.get('spray_passwords', []):
+                if self.cancel_requested:
+                    break
+                # Run one round: iterate all usernames for this password
+                if run_batch(((u, pwd) for u in usernames)):
+                    if cfg.get('spray_stop_on_success', True):
+                        break
+                # Cooldown between rounds
+                cooldown = float(cfg.get('spray_cooldown_sec', 0.0))
+                if cooldown > 0 and not self.cancel_requested:
+                    end_time = time.time() + cooldown
+                    while time.time() < end_time:
+                        if self.cancel_requested:
+                            break
+                        time.sleep(0.5)
+        else:
+            # Not spraying: iterate password candidates for a single/fixed username list (first one)
+            fixed_users = cfg.get('usernames', []) or [cfg.get('username')]
+            fixed_user = fixed_users[0]
+            if mode == 'Brute-force':
+                pw_iter = self._bruteforce_stream(min_len, max_len)
+            elif mode == 'Smart brute-force':
+                pw_iter = self._smart_bruteforce_candidates(min_len, max_len)
+            else:
+                pw_iter = self._smart_candidates(min_len, max_len)
+            run_batch(((fixed_user, pw) for pw in pw_iter))
 
         if not found_msg:
             found_msg = f"Pentest run finished. Attempts: {completed:,}. No success criteria met."
@@ -1060,19 +1215,20 @@ class PasswordListGeneratorApp:
             for tup in itertools.product(charset, repeat=L):
                 yield ''.join(tup)
 
-    def _estimate_smart_bruteforce_total(self, min_len: int, max_len: int) -> int:
-        charset = self._build_bruteforce_charset()
-        if charset:
-            freq = {}
-            for ch in (self.var_name.get() + self.var_surname.get() + self.var_city.get() + self.var_birthdate.get() + self.var_special_chars.get()):
-                if not ch:
-                    continue
-                freq[ch] = freq.get(ch, 0) + 1
-            sorted_chars = [c for c, _ in sorted(freq.items(), key=lambda kv: kv[1], reverse=True)]
-            reduced = ''.join(sorted(set((sorted_chars + list(charset)))))
-            charset = ''.join(list(reduced)[:12])
-        n = len(charset)
-        return self._geom_series(n, min_len, max_len) if n > 0 else 0
+    # UI callbacks
+    def on_browse_usernames_file(self) -> None:
+        path = filedialog.askopenfilename(filetypes=[("Text", "*.txt"), ("All files", "*.*")])
+        if not path:
+            return
+        self.var_usernames_file.set(path)
+        self.loaded_usernames = self._parse_list_file(path)
+        self.var_usernames_count.set(f"loaded: {len(self.loaded_usernames)}")
+
+    def on_browse_passwords_file(self) -> None:
+        path = filedialog.askopenfilename(filetypes=[("Text", "*.txt"), ("All files", "*.*")])
+        if not path:
+            return
+        self.var_spray_passwords_file.set(path)
 
     def run(self) -> None:
         try:
