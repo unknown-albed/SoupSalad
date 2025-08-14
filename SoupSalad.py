@@ -156,6 +156,13 @@ class PasswordListGeneratorApp:
 		self.loaded_user_agents: list[str] = []
 		self.var_user_agent_rotation = tk.StringVar(value="per_request")  # per_request | per_worker
 
+		# Logging
+		self.var_log_to_file = tk.BooleanVar(value=False)
+		self.var_log_file = tk.StringVar(value="")
+		self.var_log_append = tk.BooleanVar(value=False)
+		self._log_fp = None
+		self._log_lock = threading.Lock()
+
 		# Reporting UI variables
 		self.var_r_attempts = tk.StringVar(value="0")
 		self.var_r_successes = tk.StringVar(value="0")
@@ -321,12 +328,25 @@ class PasswordListGeneratorApp:
 		self.codes_tree.column("count", width=80, anchor="e")
 		self.codes_tree.pack(fill=tk.BOTH, expand=True)
 
+		# Time-series chart (RPS)
+		chart_wrap = ttk.Frame(report)
+		chart_wrap.grid(row=row+2, column=0, columnspan=3, sticky="we", pady=(8,0))
+		chart_wrap.grid_columnconfigure(0, weight=1)
+		self.chart_canvas = tk.Canvas(chart_wrap, height=120, background="#ffffff", highlightthickness=1, highlightbackground="#ccc")
+		self.chart_canvas.grid(row=0, column=0, sticky="we")
+
 		# Reporting actions
 		actions = ttk.Frame(report)
 		actions.grid(row=row+1, column=0, columnspan=3, sticky="we", pady=(8,0))
 		ttk.Button(actions, text="Export JSON", command=self.on_export_report_json).pack(side=tk.LEFT)
 		tkbtn = ttk.Button(actions, text="Export CSV", command=self.on_export_report_csv)
 		tkbtn.pack(side=tk.LEFT, padx=8)
+		# Logging controls
+		ttk.Checkbutton(actions, text="Log to file", variable=self.var_log_to_file).pack(side=tk.LEFT, padx=12)
+		log_entry = ttk.Entry(actions, textvariable=self.var_log_file, width=48)
+		log_entry.pack(side=tk.LEFT, padx=4)
+		ttk.Button(actions, text="Browse…", command=self.on_browse_log_file).pack(side=tk.LEFT, padx=4)
+		ttk.Checkbutton(actions, text="Append", variable=self.var_log_append).pack(side=tk.LEFT, padx=8)
 
 		# Actions
 		actions2 = ttk.Frame(main)
@@ -403,6 +423,8 @@ class PasswordListGeneratorApp:
 			self.progress_var.set(min(100.0, self.progress_var.get()))
 		msg = extra or f"Completed. Processed {completed:,} items."
 		self.status_var.set(msg)
+		# Close log file if open
+		self._close_log_file()
 		try:
 			if self.use_bootstrap:
 				TbMessagebox.show_info("Done", msg)
@@ -490,8 +512,79 @@ class PasswordListGeneratorApp:
 				self.codes_tree.delete(row_id)
 			for code, count in sorted(status_counts.items()):
 				self.codes_tree.insert("", tk.END, values=(code, count))
+			# Time-series chart (RPS)
+			self._draw_timeseries_chart()
 		finally:
 			self.root.after(750, self._refresh_reporting_ui)
+
+	def _draw_timeseries_chart(self) -> None:
+		canvas = self.chart_canvas
+		if not canvas:
+			return
+		w = int(canvas.winfo_width() or 400)
+		h = int(canvas.winfo_height() or 120)
+		canvas.delete("all")
+		# Build attempts/sec over last 60s
+		now = time.time()
+		with self.metrics_lock:
+			ts = list(self.metrics["attempt_timestamps"])  # copy
+		buckets = [0]*60
+		for t in ts:
+			d = int(now - t)
+			if 0 <= d < 60:
+				buckets[59 - d] += 1
+		maxv = max(buckets) if buckets else 1
+		maxv = max(maxv, 1)
+		# axes
+		canvas.create_line(30, h-20, w-10, h-20, fill="#ddd")
+		canvas.create_line(30, 10, 30, h-20, fill="#ddd")
+		# polyline
+		if buckets:
+			plot_w = w - 40
+			plot_h = h - 30
+			points = []
+			for i, v in enumerate(buckets):
+				x = 30 + (i/(len(buckets)-1)) * plot_w if len(buckets) > 1 else 30
+				y = (h-20) - (v/maxv) * plot_h
+				points.extend([x, y])
+			canvas.create_line(points, fill="#2a7", width=2, smooth=True)
+			# labels
+			canvas.create_text(w-12, h-26, text=f"peak {maxv}/s", anchor="ne", fill="#555", font=("", 8))
+			canvas.create_text(32, 12, text="RPS last 60s", anchor="nw", fill="#555", font=("", 9, "bold"))
+
+	def _default_log_path(self) -> str:
+		stamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+		return os.path.join(os.getcwd(), f"pentest-log-{stamp}.csv")
+
+	def _open_log_file(self) -> None:
+		path = self.var_log_file.get().strip() or self._default_log_path()
+		mode = 'a' if self.var_log_append.get() else 'w'
+		try:
+			self._log_fp = open(path, mode, encoding='utf-8')
+			if mode == 'w':
+				self._log_fp.write("timestamp,username,password,status_code,latency_ms,success,lockout,error,proxy,ua\n")
+		except Exception as exc:
+			self._append_preview(f"Failed to open log file: {exc}")
+			self._log_fp = None
+
+	def _close_log_file(self) -> None:
+		try:
+			if self._log_fp:
+				self._log_fp.flush()
+				self._log_fp.close()
+		except Exception:
+			pass
+		finally:
+			self._log_fp = None
+
+	def _log_line(self, parts: list) -> None:
+		if not self._log_fp:
+			return
+		try:
+			with self._log_lock:
+				self._log_fp.write(",".join(str(p).replace('\n',' ').replace('\r',' ') for p in parts) + "\n")
+		except Exception:
+			pass
 
 	def on_generate(self) -> None:
 		if self.is_running:
@@ -640,6 +733,12 @@ class PasswordListGeneratorApp:
 		self.total_estimated = total_est
 		self.start_time = time.time()
 		self._reset_metrics(pentest_enabled)
+		# Open log file if enabled
+		if pentest_enabled and self.var_log_to_file.get():
+			if not self.var_log_file.get().strip():
+				self.var_log_file.set(self._default_log_path())
+			self._open_log_file()
+			self._log_line(["# start", datetime.now().isoformat(timespec='seconds'), self.var_target_url.get().strip()])
 
 		# Start worker
 		self.is_running = True
