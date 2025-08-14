@@ -238,6 +238,9 @@ class PasswordListGeneratorApp:
 		# Graceful close
 		self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
+		self.var_wkhtmltopdf_path = tk.StringVar(value="wkhtmltopdf")
+		self.flow_context_last: dict = {}
+
 	def _default_output_path(self) -> str:
 		timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 		base = f"Passwordlist-{timestamp}.txt"
@@ -2938,6 +2941,11 @@ class PasswordListGeneratorApp:
 						self.ui_queue.put(("log", f"[Flow] Extracted {re_var}"))
 				except Exception as _exc:
 					self.ui_queue.put(("log", f"[Flow] Extract failed: {_exc}"))
+		# remember last context for templating in login request
+		try:
+			self.flow_context_last = dict(context)
+		except Exception:
+			self.flow_context_last = {}
 
 
 if __name__ == "__main__":
