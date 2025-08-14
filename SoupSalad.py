@@ -48,6 +48,9 @@ try:
 except Exception:
 	requests_ntlm = None
 
+import asyncio
+import random
+
 
 class RateLimiter:
 	def __init__(self, qps: float) -> None:
@@ -3300,6 +3303,66 @@ class PasswordListGeneratorApp:
 		except Exception as exc:
 			self.ui_queue.put(("log", f"[Intruder] Fatal error: {exc}"))
 			self._on_done()
+
+	async def _run_flow_async(self, cfg: dict, username: str, password: str) -> dict:
+		if httpx is None:
+			return {}
+		context = {"username": username, "password": password}
+		headers = cfg.get('headers') or {}
+		cookies = cfg.get('cookies') or {}
+		proxies = cfg.get('proxies') or None
+		verify = cfg.get('verify', True)
+		http2 = bool(cfg.get('http2'))
+		timeout = cfg.get('timeout') or 15.0
+		async with httpx.AsyncClient(headers=headers, cookies=cookies, verify=verify, http2=http2, timeout=timeout, proxies=proxies, follow_redirects=True) as client:
+			for step in self.flow_steps:
+				method = (step.get('method') or 'GET').upper()
+				url = self._format_template(step.get('url') or '', context)
+				if not url:
+					continue
+				step_headers = step.get('headers') or {}
+				body_mode = step.get('body_mode') or 'params'
+				body_templ = step.get('body') or ''
+				if method == 'GET':
+					params = {}
+					if body_templ.strip():
+						try:
+							params = dict(x.split('=',1) for x in self._format_template(body_templ, context).split('&') if '=' in x)
+						except Exception:
+							params = {}
+					resp = await client.get(url, params=params, headers=step_headers)
+				else:
+					json_payload = None
+					data = None
+					if body_mode == 'json':
+						try:
+							json_payload = json.loads(self._format_template(body_templ, context))
+						except Exception:
+							data = self._format_template(body_templ, context)
+					else:
+						data = self._format_template(body_templ, context)
+					resp = await client.post(url, json=json_payload, data=data if json_payload is None else None, headers=step_headers)
+				# extract
+				re_pat = (step.get('extract_regex') or '').strip()
+				re_var = (step.get('extract_var') or '').strip()
+				if re_pat and re_var:
+					try:
+						m = re.search(re_pat, resp.text or '')
+						if m:
+							context[re_var] = m.group(1) if m.groups() else m.group(0)
+							self.ui_queue.put(("log", f"[Flow-async] Extracted {re_var}"))
+					except Exception as _exc:
+						self.ui_queue.put(("log", f"[Flow-async] Extract failed: {_exc}"))
+		# remember last context
+		try:
+			self.flow_context_last = dict(context)
+		except Exception:
+			self.flow_context_last = {}
+		# return cookies to apply to sync session
+		try:
+			return dict(client.cookies)
+		except Exception:
+			return {}
 
 
 if __name__ == "__main__":
