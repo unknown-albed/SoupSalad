@@ -209,6 +209,13 @@ class PasswordListGeneratorApp:
 		self.var_success_require_redirect = tk.BooleanVar(value=False)
 		self.var_success_length_gt = tk.IntVar(value=0)
 
+		# OSCP Safe Mode
+		self.var_safe_mode = tk.BooleanVar(value=False)
+		self.var_allowlist = tk.StringVar(value="")  # comma-separated hosts or regex
+		self.var_safe_qps_cap = tk.DoubleVar(value=1.0)
+		self.var_safe_concurrency_cap = tk.IntVar(value=2)
+		self.var_safe_auto_pause = tk.BooleanVar(value=True)
+
 		# Reporting UI variables
 		self.var_r_attempts = tk.StringVar(value="0")
 		self.var_r_successes = tk.StringVar(value="0")
@@ -425,6 +432,16 @@ class PasswordListGeneratorApp:
 		ttk.Label(btns, text="Length >= ").pack(side=tk.LEFT)
 		spinLen = ttk.Spinbox(btns, textvariable=self.var_success_length_gt, from_=0, to=10_000_000, width=8)
 		spinLen.pack(side=tk.LEFT, padx=4)
+		# OSCP Safe Mode
+		safe = ttk.LabelFrame(main, text="OSCP Safe Mode")
+		safe.pack(fill=tk.X, **padding)
+		ttk.Checkbutton(safe, text="Enable Safe Mode", variable=self.var_safe_mode).grid(row=0, column=0, sticky="w", padx=4, pady=4)
+		self._add_labeled_entry(safe, "Allowlist (hosts/regex, comma)", self.var_allowlist, row=0, col=1)
+		self._add_labeled_spinbox(safe, "QPS cap", self.var_safe_qps_cap, row=0, col=3, from_=0.1, to=5)
+		self._add_labeled_spinbox(safe, "Concurrency cap", self.var_safe_concurrency_cap, row=0, col=5, from_=1, to=5)
+		ttk.Checkbutton(safe, text="Auto-pause on lockout/CAPTCHA", variable=self.var_safe_auto_pause).grid(row=0, column=7, sticky="w", padx=4, pady=4)
+		for i in range(0, 8):
+			safe.grid_columnconfigure(i, weight=1)
 		# Reporting actions
 		actions = ttk.Frame(report)
 		actions.grid(row=row+1, column=0, columnspan=3, sticky="we", pady=(8,0))
@@ -432,6 +449,7 @@ class PasswordListGeneratorApp:
 		tkbtn = ttk.Button(actions, text="Export CSV", command=self.on_export_report_csv)
 		tkbtn.pack(side=tk.LEFT, padx=8)
 		ttk.Button(actions, text="Export HTML", command=self.on_export_report_html).pack(side=tk.LEFT, padx=8)
+		ttk.Button(actions, text="Export Evidence Bundle", command=self.on_export_evidence_bundle).pack(side=tk.LEFT, padx=8)
 		# Artifacts capture controls
 		ttk.Checkbutton(actions, text="Capture artifacts", variable=self.var_capture_enabled).pack(side=tk.LEFT, padx=12)
 		ttk.Label(actions, text="Max N").pack(side=tk.LEFT)
@@ -711,6 +729,24 @@ class PasswordListGeneratorApp:
 			if not url:
 				messagebox.showerror("Target URL", "Please enter the target URL.")
 				return
+			# Safe mode allowlist enforcement
+			if self.var_safe_mode.get() and self.var_allowlist.get().strip():
+				try:
+					host = urlparse(url).hostname or ""
+					allowed = False
+					for pat in [p.strip() for p in self.var_allowlist.get().split(',') if p.strip()]:
+						if pat.startswith('^') or pat.endswith('$'):
+							import re as _re
+							if _re.search(pat, host):
+								allowed = True; break
+						else:
+							if pat in host:
+								allowed = True; break
+					if not allowed:
+						messagebox.showerror("Safe Mode", f"Host '{host}' not in allowlist. Update allowlist to proceed.")
+						return
+				except Exception:
+					pass
 			username = self.var_username_value.get().strip()
 			user_param = self.var_user_param.get().strip() or "username"
 			pass_param = self.var_pass_param.get().strip() or "password"
@@ -726,6 +762,11 @@ class PasswordListGeneratorApp:
 			verify_tls = bool(self.var_verify_tls.get())
 			timeout = float(self.var_timeout.get() or 15.0)
 			concurrency = max(1, int(self.var_concurrency.get() or 5))
+			# Safe mode caps
+			if self.var_safe_mode.get():
+				qps = min(qps, float(self.var_safe_qps_cap.get() or 1.0))
+				concurrency = min(concurrency, int(self.var_safe_concurrency_cap.get() or 2))
+				self.var_lockout_jitter.set(True)
 			# Usernames collection
 			usernames = self._collect_usernames(username)
 			if not usernames:
@@ -824,6 +865,8 @@ class PasswordListGeneratorApp:
 				# success signals
 				"success_require_redirect": bool(self.var_success_require_redirect.get()),
 				"success_length_gt": int(self.var_success_length_gt.get() or 0),
+				# safe mode
+				"safe_auto_pause": bool(self.var_safe_auto_pause.get()),
 			}
 
 		mode = self.var_mode.get()
@@ -996,6 +1039,8 @@ class PasswordListGeneratorApp:
 			"raw_body": self.raw_body_text.get("1.0", 'end-1c'),
 			"success_require_redirect": bool(self.var_success_require_redirect.get()),
 			"success_length_gt": int(self.var_success_length_gt.get() or 0),
+			# safe mode
+			"safe_auto_pause": bool(self.var_safe_auto_pause.get()),
 		}
 		path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("Profile JSON", "*.json"), ("All files", "*.*")])
 		if not path:
@@ -1114,6 +1159,12 @@ class PasswordListGeneratorApp:
 		self.raw_body_text.delete('1.0', tk.END); self.raw_body_text.insert(tk.END, profile.get("raw_body", ""))
 		self.var_success_require_redirect.set(bool(profile.get("success_require_redirect", False)))
 		self.var_success_length_gt.set(int(profile.get("success_length_gt", 0)))
+		# safe mode
+		self.var_safe_mode.set(bool(profile.get("safe_auto_pause")))
+		self.var_allowlist.set(", ".join(profile.get("allowlist", [])))
+		self.var_safe_qps_cap.set(float(profile.get("safe_qps_cap", 1.0)))
+		self.var_safe_concurrency_cap.set(int(profile.get("safe_concurrency_cap", 2)))
+		self.var_safe_auto_pause.set(bool(profile.get("safe_auto_pause")))
 
 		self._info("Profile loaded")
 
@@ -1692,6 +1743,10 @@ class PasswordListGeneratorApp:
 					delay = max(1.0, base)
 				lockout_until[0] = max(lockout_until[0], time.time() + delay)
 			self.ui_queue.put(("log", f"[Lockout] Detected; backing off for ~{int(delay)}s"))
+			# Safe mode auto-pause
+			if cfg.get('safe_auto_pause'):
+				self.cancel_requested = True
+				self.ui_queue.put(("log", "[Safe Mode] Auto-paused due to lockout"))
 
 		def run_batch(pair_iterable) -> bool:
 			# returns True if success found and stop
@@ -2519,6 +2574,125 @@ class PasswordListGeneratorApp:
 				imp['pass_param'] = k
 				break
 		return imp
+
+	def on_export_evidence_bundle(self) -> None:
+		s = self._report_snapshot()
+		dirpath = filedialog.askdirectory()
+		if not dirpath:
+			return
+		try:
+			# HTML
+			path_html = os.path.join(dirpath, 'report.html')
+			# reuse HTML export logic
+			with self.metrics_lock:
+				ats = list(self.metrics["attempt_timestamps"])  # copy
+			now = time.time()
+			buckets = [0]*60
+			for t in ats:
+				d = int(now - t)
+				if 0 <= d < 60:
+					buckets[59 - d] += 1
+			html = f"<html><head><meta charset='utf-8'><script src='https://cdn.jsdelivr.net/npm/chart.js'></script></head><body><h1>Pentest Report</h1><pre>{json.dumps(s, indent=2)}</pre><canvas id='c' height='120'></canvas><script>const d={json.dumps(buckets)};new Chart(document.getElementById('c').getContext('2d'),{{type:'line',data:{{labels:d.map((_,i)=>i-59),datasets:[{{label:'RPS',data:d,borderColor:'#2a7',tension:0.25}}]}},options:{{plugins:{{legend:{{display:false}}}},scales:{{x:{{display:false}},y:{{beginAtZero:true}}}}}}}});</script></body></html>"
+			with open(path_html, 'w', encoding='utf-8') as f:
+				f.write(html)
+			# JSON
+			with open(os.path.join(dirpath, 'report.json'), 'w', encoding='utf-8') as f:
+				json.dump(s, f, indent=2)
+			# CSV
+			lines = ["metric,value"]
+			for k in ["attempts","successes","failures","lockouts","errors","rps_10s","latency_p50_ms","latency_p95_ms","latency_p99_ms"]:
+				lines.append(f"{k},{s.get(k,'')}")
+			lines.append("status_code,count")
+			for code, cnt in sorted((s.get("status_counts") or {}).items()):
+				lines.append(f"{code},{cnt}")
+			with open(os.path.join(dirpath, 'report.csv'), 'w', encoding='utf-8') as f:
+				f.write("\n".join(lines))
+			# Artifacts
+			self._export_artifacts_to_dir(dirpath)
+			# HAR
+			har = self._build_har()
+			with open(os.path.join(dirpath, 'session.har'), 'w', encoding='utf-8') as f:
+				json.dump(har, f, indent=2)
+			# Screenshot
+			self._screenshot_target(self.var_target_url.get().strip(), os.path.join(dirpath, 'screenshot.png'))
+			self._append_preview(f"Evidence bundle saved to {dirpath}")
+		except Exception as exc:
+			messagebox.showerror("Export failed", str(exc))
+
+	def _export_artifacts_to_dir(self, dirpath: str) -> None:
+		if not self.captured_artifacts:
+			return
+		for i, a in enumerate(self.captured_artifacts, 1):
+			prefix = os.path.join(dirpath, f"artifact_{i:03d}")
+			try:
+				with open(prefix + ".request.txt", 'w', encoding='utf-8') as f:
+					f.write(a.get('raw_request',''))
+				with open(prefix + ".response.txt", 'w', encoding='utf-8') as f:
+					f.write(a.get('raw_response',''))
+				with open(prefix + ".curl.sh", 'w', encoding='utf-8') as f:
+					f.write(a.get('curl',''))
+			except Exception:
+				pass
+
+	def _build_har(self) -> dict:
+		entries = []
+		for a in self.captured_artifacts:
+			req_headers = [{"name":k, "value":v} for k,v in (a.get('headers') or {}).items()]
+			query = []
+			postData = None
+			if a.get('method','GET').upper() == 'GET':
+				from urllib.parse import urlparse, parse_qsl
+				parsed = urlparse(a.get('url',''))
+				query = [{"name":k, "value":v} for k,v in parse_qsl(parsed.query, keep_blank_values=True)]
+			else:
+				postData = {
+					"mimeType": (a.get('headers',{}).get('Content-Type') or 'application/x-www-form-urlencoded'),
+					"text": urlencode(a.get('params') or {})
+				}
+			entries.append({
+				"startedDateTime": a.get('timestamp'),
+				"time": a.get('latency_ms', 0),
+				"request": {
+					"method": a.get('method','GET'),
+					"url": a.get('url',''),
+					"httpVersion": "HTTP/1.1",
+					"headers": req_headers,
+					"queryString": query,
+					"postData": postData,
+					"headersSize": -1,
+					"bodySize": -1,
+				},
+				"response": {
+					"status": int(a.get('status') or 0),
+					"statusText": "",
+					"httpVersion": "HTTP/1.1",
+					"headers": [],
+					"content": {"size": len(a.get('raw_response','')), "mimeType": "text/html", "text": a.get('raw_response','')[: int(self.var_capture_max_bytes.get() or 65536)]},
+					"redirectURL": "",
+					"headersSize": -1,
+					"bodySize": -1,
+				},
+				"cache": {},
+				"timings": {"send": 0, "wait": a.get('latency_ms', 0), "receive": 0}
+			})
+		return {"log": {"version": "1.2", "creator": {"name": "SoupSalad", "version": "1.0"}, "entries": entries}}
+
+	def _screenshot_target(self, url: str, out_path: str) -> None:
+		if not url:
+			return
+		try:
+			from playwright.sync_api import sync_playwright
+		except Exception:
+			return
+		try:
+			with sync_playwright() as p:
+				browser = p.chromium.launch(headless=True)
+				page = browser.new_page()
+				page.goto(url, wait_until='domcontentloaded', timeout=15000)
+				page.screenshot(path=out_path, full_page=True)
+				browser.close()
+		except Exception:
+			pass
 
 
 if __name__ == "__main__":
