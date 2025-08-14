@@ -262,6 +262,9 @@ class PasswordListGeneratorApp:
 		self.var_intruder_marker = tk.StringVar(value="§PAYLOAD§")
 		self.var_intruder_payloads_file = tk.StringVar(value="")
 		self.var_intruder_builtin = tk.StringVar(value="none")  # none,sqli,ssti,lfi,traversal,xss,cmdi
+		self.var_intruder_mode = tk.StringVar(value="sniper")  # sniper,pitchfork,clusterbomb
+		self.var_intruder_markers = tk.StringVar(value="§PAYLOAD§")
+		self.intruder_sets_text = tk.StringVar(value="")  # lines: MARKER=source
 
 	def _default_output_path(self) -> str:
 		timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
@@ -556,12 +559,24 @@ class PasswordListGeneratorApp:
 			authf.grid_columnconfigure(i, weight=1)
 
 		# Intruder
-		intr = ttk.LabelFrame(main, text="Intruder (Sniper)")
+		intr = ttk.LabelFrame(main, text="Intruder")
 		intr.pack(fill=tk.X, **padding)
 		self._add_labeled_check(intr, "Enable Intruder", self.var_intruder_enabled, row=0, col=0)
-		self._add_labeled_entry(intr, "Marker", self.var_intruder_marker, row=0, col=2)
-		self._add_labeled_entry(intr, "Payloads file", self.var_intruder_payloads_file, row=0, col=4)
-		self._add_labeled_combobox(intr, "Builtin set", self.var_intruder_builtin, ["none","sqli","ssti","lfi","traversal","xss","cmdi"], row=0, col=6)
+		self._add_labeled_combobox(intr, "Mode", self.var_intruder_mode, ["sniper","pitchfork","clusterbomb"], row=0, col=2)
+		self._add_labeled_entry(intr, "Markers (csv)", self.var_intruder_markers, row=0, col=4)
+		self._add_labeled_entry(intr, "Single marker (compat)", self.var_intruder_marker, row=0, col=6)
+		self._add_labeled_entry(intr, "Payloads file (compat)", self.var_intruder_payloads_file, row=1, col=0)
+		self._add_labeled_combobox(intr, "Builtin (compat)", self.var_intruder_builtin, ["none","sqli","ssti","lfi","traversal","xss","cmdi"], row=1, col=2)
+		lblm = ttk.Label(intr, text="Sets mapping (one per line: MARKER=source; source: file:/path or builtin:kind)")
+		lblm.grid(row=2, column=0, sticky="w", padx=4, pady=2, columnspan=2)
+		self.intr_sets_box = scrolledtext.ScrolledText(intr, height=4)
+		self.intr_sets_box.grid(row=3, column=0, columnspan=8, sticky="we", padx=4, pady=4)
+		btn_row = ttk.Frame(intr)
+		btn_row.grid(row=4, column=0, columnspan=8, sticky="w")
+		pp = ttk.Button(btn_row, text="Preview payloads", command=self.on_intruder_preview)
+		pp.pack(side=tk.LEFT, padx=4)
+		dd = ttk.Button(btn_row, text="Download seclists…", command=self.on_download_seclists)
+		dd.pack(side=tk.LEFT, padx=4)
 		for i in range(0, 8):
 			intr.grid_columnconfigure(i, weight=1)
 
@@ -927,9 +942,12 @@ class PasswordListGeneratorApp:
 				"notes": self.notes_text.get('1.0','end-1c') if hasattr(self, 'notes_text') else "",
 				# intruder
 				"intruder_enabled": bool(self.var_intruder_enabled.get()),
+				"intruder_mode": (self.var_intruder_mode.get() or 'sniper'),
+				"intruder_markers": [m.strip() for m in (self.var_intruder_markers.get() or '').split(',') if m.strip()],
 				"intruder_marker": self.var_intruder_marker.get(),
 				"intruder_payloads_file": self.var_intruder_payloads_file.get(),
 				"intruder_builtin": self.var_intruder_builtin.get(),
+				"intruder_sets_text": self.intr_sets_box.get('1.0','end-1c'),
 			}
 
 		mode = self.var_mode.get()
@@ -1117,9 +1135,12 @@ class PasswordListGeneratorApp:
 			"auth_domain": self.var_auth_domain.get(),
 			# intruder
 			"intruder_enabled": bool(self.var_intruder_enabled.get()),
+			"intruder_mode": (self.var_intruder_mode.get() or 'sniper'),
+			"intruder_markers": [m.strip() for m in (self.var_intruder_markers.get() or '').split(',') if m.strip()],
 			"intruder_marker": self.var_intruder_marker.get(),
 			"intruder_payloads_file": self.var_intruder_payloads_file.get(),
 			"intruder_builtin": self.var_intruder_builtin.get(),
+			"intruder_sets_text": self.intr_sets_box.get('1.0','end-1c'),
 		}
 		path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("Profile JSON", "*.json"), ("All files", "*.*")])
 		if not path:
@@ -1260,9 +1281,16 @@ class PasswordListGeneratorApp:
 		self.var_auth_domain.set(profile.get('auth_domain',''))
 		# intruder
 		self.var_intruder_enabled.set(bool(profile.get('intruder_enabled', False)))
+		self.var_intruder_mode.set(profile.get('intruder_mode','sniper'))
+		self.var_intruder_markers.set(','.join(profile.get('intruder_markers', [])))
 		self.var_intruder_marker.set(profile.get('intruder_marker','§PAYLOAD§'))
 		self.var_intruder_payloads_file.set(profile.get('intruder_payloads_file',''))
 		self.var_intruder_builtin.set(profile.get('intruder_builtin','none'))
+		try:
+			self.intr_sets_box.delete('1.0', tk.END)
+			self.intr_sets_box.insert('1.0', profile.get('intruder_sets_text',''))
+		except Exception:
+			pass
 
 		self._info("Profile loaded")
 
@@ -1707,6 +1735,15 @@ class PasswordListGeneratorApp:
 							for ck, cv in self.flow_context_last.items():
 								val = val.replace(f"{{{{{ck}}}}}", str(cv))
 							data[k] = val
+				ipl = cfg.get('intruder_payload_current')
+				if isinstance(ipl, dict):
+					for mk, pv in ipl.items():
+						if mk:
+							url = url.replace(mk, str(pv))
+				elif ipl is not None:
+					marker = cfg.get('intruder_marker') or ''
+					if marker:
+						url = url.replace(marker, str(ipl))
 				resp = sess.get(url, params=data, timeout=cfg['timeout'], headers=call_headers, proxies=call_proxies, auth=self._build_http_auth(cfg))
 			else:
 				if cfg.get('flow_enabled') and cfg.get('flow_per_attempt') and self.flow_steps:
@@ -3050,16 +3087,108 @@ class PasswordListGeneratorApp:
 			return [";id","|id","& whoami","$(id)"]
 		return []
 
+	def _parse_intruder_sets_text(self, text: str) -> dict:
+		sets: dict[str, list[str]] = {}
+		lines = [ln.strip() for ln in (text or '').splitlines() if ln.strip() and not ln.strip().startswith('#')]
+		for ln in lines:
+			if '=' not in ln:
+				continue
+			marker, src = ln.split('=', 1)
+			marker = marker.strip()
+			src = src.strip()
+			payloads: list[str] = []
+			try:
+				if src.startswith('file:'):
+					path = src[len('file:'):].strip()
+					payloads = self._parse_list_file(path)
+				elif src.startswith('builtin:'):
+					payloads = self._intruder_builtin_payloads(src[len('builtin:'):].strip())
+				else:
+					# default treat as file path
+					payloads = self._parse_list_file(src)
+			except Exception:
+				payloads = []
+			if payloads:
+				sets[marker] = payloads
+		return sets
+
+	def on_intruder_preview(self) -> None:
+		sets = self._parse_intruder_sets_text(self.intr_sets_box.get('1.0','end-1c'))
+		if not sets and self.var_intruder_payloads_file.get().strip():
+			sets = {self.var_intruder_marker.get() or '§PAYLOAD§': self._parse_list_file(self.var_intruder_payloads_file.get().strip())}
+		if not sets:
+			messagebox.showinfo("Intruder", "No payload sets configured")
+			return
+		win = tk.Toplevel(self.root)
+		win.title("Intruder preview")
+		txt = scrolledtext.ScrolledText(win, height=18, width=100)
+		txt.pack(fill=tk.BOTH, expand=True)
+		for mk, arr in sets.items():
+			txt.insert('end', f"Marker: {mk} - {len(arr)} payloads\n")
+			for line in arr[:20]:
+				txt.insert('end', f"  {line}\n")
+			txt.insert('end', "\n")
+		txt.configure(state='disabled')
+
+	def on_download_seclists(self) -> None:
+		# Minimal chooser for common sets
+		win = tk.Toplevel(self.root)
+		win.title("Download Seclists")
+		options = [
+			("Passwords Top-100", "passwords_top100", "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Common-Credentials/top-100.txt"),
+			("SQLi Generic", "sqli_generic", "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Fuzzing/SQLi/Generic-SQLi.txt"),
+			("XSS Jhaddix", "xss_jhaddix", "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/xss-portswigger.txt")
+		]
+		checks: list[tuple[tk.BooleanVar, tuple]] = []
+		row = 0
+		for label, key, url in options:
+			v = tk.BooleanVar(value=False)
+			cb = ttk.Checkbutton(win, text=label, variable=v)
+			cb.grid(row=row, column=0, sticky='w', padx=6, pady=4)
+			checks.append((v, (label, key, url)))
+			row += 1
+		btnf = ttk.Frame(win); btnf.grid(row=row, column=0, sticky='w')
+		def do_download():
+			base = os.path.join(os.getcwd(), 'seclists')
+			os.makedirs(base, exist_ok=True)
+			import urllib.request
+			ok_any = False
+			for var, meta in checks:
+				if not var.get():
+					continue
+				label, key, url = meta
+				out = os.path.join(base, key + '.txt')
+				try:
+					with urllib.request.urlopen(url, timeout=20) as r, open(out, 'wb') as f:
+						f.write(r.read())
+					ok_any = True
+					self.ui_queue.put(("log", f"Downloaded {label} -> {out}"))
+				except Exception as exc:
+					messagebox.showerror("Download failed", f"{label}: {exc}")
+			if ok_any:
+				messagebox.showinfo("Seclists", f"Saved to {base}")
+			win.destroy()
+		ttk.Button(btnf, text="Download", command=do_download).pack(side=tk.LEFT, padx=6)
+		ttk.Button(btnf, text="Close", command=win.destroy).pack(side=tk.LEFT, padx=6)
+
 	def _worker_intruder(self, cfg: dict) -> None:
 		try:
-			marker = cfg.get('intruder_marker') or '§PAYLOAD§'
-			payloads = []
-			if cfg.get('intruder_payloads_file'):
-				payloads = self._parse_list_file(cfg.get('intruder_payloads_file'))
-			if not payloads:
-				payloads = self._intruder_builtin_payloads(cfg.get('intruder_builtin'))
-			if not payloads:
-				self.ui_queue.put(("log", "[Intruder] No payloads provided"))
+			mode = (cfg.get('intruder_mode') or 'sniper').lower()
+			sets = self._parse_intruder_sets_text(cfg.get('intruder_sets_text') or '')
+			markers = cfg.get('intruder_markers') or []
+			if not sets and (cfg.get('intruder_payloads_file') or cfg.get('intruder_builtin') != 'none'):
+				mk = cfg.get('intruder_marker') or '§PAYLOAD§'
+				arr = []
+				if cfg.get('intruder_payloads_file'):
+					arr = self._parse_list_file(cfg.get('intruder_payloads_file'))
+				if not arr:
+					arr = self._intruder_builtin_payloads(cfg.get('intruder_builtin'))
+				if arr:
+					sets = {mk: arr}
+			if not markers and sets:
+				markers = list(sets.keys())
+			if not sets or not markers:
+				self.ui_queue.put(("log", "[Intruder] No payload sets configured"))
 				self._on_done()
 				return
 			sess = requests.Session()
@@ -3074,24 +3203,53 @@ class PasswordListGeneratorApp:
 			stop_event = threading.Event()
 			lock = threading.Lock()
 			idx = 0
-			for payload in payloads:
+			def iter_combos():
+				if mode == 'sniper':
+					# iterate each marker separately
+					for mk in markers:
+						arr = sets.get(mk, [])
+						for pv in arr:
+							yield {mk: pv}
+				elif mode == 'pitchfork':
+					# zip over markers up to min length
+					lens = [len(sets.get(mk, [])) for mk in markers]
+					if not lens or min(lens) == 0:
+						return
+					for i in range(min(lens)):
+						combo = {mk: sets.get(mk, [])[i] for mk in markers}
+						yield combo
+				else:
+					# clusterbomb cartesian product (cap to avoid explosion)
+					max_combos = 20000
+					from itertools import product
+					arrays = [sets.get(mk, []) for mk in markers]
+					if any(not arr for arr in arrays):
+						return
+					count = 0
+					for tup in product(*arrays):
+						combo = {mk: pv for mk, pv in zip(markers, tup)}
+						yield combo
+						count += 1
+						if count >= max_combos:
+							self.ui_queue.put(("log", f"[Intruder] Reached max combos cap {max_combos}") )
+							break
+			for combo in iter_combos():
 				if self.cancel_requested:
 					break
 				idx += 1
 				try:
 					rate.acquire()
 					t0 = time.time()
-					# Build per-call headers/proxies may rotate later; keep as-is
-					cfg['intruder_payload_current'] = payload
+					cfg['intruder_payload_current'] = combo
 					resp = self._http_attempt(sess, cfg, username="", password="", call_headers=None, call_proxies=None, call_params_extra=None)
 					lat = int((time.time() - t0) * 1000)
 					ok = self._is_success(resp, cfg)
 					self._record_attempt(ok, resp.status_code if resp else 0, lat)
-					self._maybe_capture_artifact(cfg, resp, username=f"INTRUDER:{payload}", password="", extra_notes="intruder")
+					self._maybe_capture_artifact(cfg, resp, username=f"INTRUDER:{combo}", password="", extra_notes="intruder")
 					if ok:
-						self.ui_queue.put(("log", f"[Intruder] Potential hit with payload: {payload}"))
+						self.ui_queue.put(("log", f"[Intruder] Potential hit with combo: {combo}"))
 				except Exception as exc:
-					self.ui_queue.put(("log", f"[Intruder] Error on payload {payload}: {exc}"))
+					self.ui_queue.put(("log", f"[Intruder] Error on combo {combo}: {exc}"))
 					self._record_attempt(False, 0, 0, error=True)
 			self._on_done()
 		except Exception as exc:
