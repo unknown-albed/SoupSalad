@@ -11,6 +11,7 @@ import re
 from collections import deque
 from datetime import datetime
 from urllib.parse import urlparse
+from urllib.parse import urlencode
 
 import tkinter as tk
 from tkinter import filedialog
@@ -167,6 +168,13 @@ class PasswordListGeneratorApp:
 		self.var_log_append = tk.BooleanVar(value=False)
 		self._log_fp = None
 		self._log_lock = threading.Lock()
+		# Artifacts capture
+		self.var_capture_enabled = tk.BooleanVar(value=False)
+		self.var_capture_max_artifacts = tk.IntVar(value=20)
+		self.var_capture_max_bytes = tk.IntVar(value=65536)
+		self.var_capture_failures_n = tk.IntVar(value=5)
+		self.captured_artifacts: list[dict] = []
+		self._failures_captured = 0
 
 		# Engine (sync vs async)
 		self.var_async_engine = tk.BooleanVar(value=False)
@@ -395,6 +403,18 @@ class PasswordListGeneratorApp:
 		tkbtn = ttk.Button(actions, text="Export CSV", command=self.on_export_report_csv)
 		tkbtn.pack(side=tk.LEFT, padx=8)
 		ttk.Button(actions, text="Export HTML", command=self.on_export_report_html).pack(side=tk.LEFT, padx=8)
+		# Artifacts capture controls
+		ttk.Checkbutton(actions, text="Capture artifacts", variable=self.var_capture_enabled).pack(side=tk.LEFT, padx=12)
+		ttk.Label(actions, text="Max N").pack(side=tk.LEFT)
+		spinN = ttk.Spinbox(actions, textvariable=self.var_capture_max_artifacts, from_=1, to=200)
+		spinN.pack(side=tk.LEFT, padx=4)
+		ttk.Label(actions, text="Max bytes").pack(side=tk.LEFT)
+		spinB = ttk.Spinbox(actions, textvariable=self.var_capture_max_bytes, from_=1024, to=10485760)
+		spinB.pack(side=tk.LEFT, padx=4)
+		ttk.Label(actions, text="Failures N").pack(side=tk.LEFT)
+		spinF = ttk.Spinbox(actions, textvariable=self.var_capture_failures_n, from_=0, to=50)
+		spinF.pack(side=tk.LEFT, padx=4)
+		ttk.Button(actions, text="Export Artifacts", command=self.on_export_artifacts).pack(side=tk.LEFT, padx=8)
 		# Logging controls
 		ttk.Checkbutton(actions, text="Log to file", variable=self.var_log_to_file).pack(side=tk.LEFT, padx=12)
 		log_entry = ttk.Entry(actions, textvariable=self.var_log_file, width=48)
@@ -814,6 +834,9 @@ class PasswordListGeneratorApp:
 				self.var_log_file.set(self._default_log_path())
 			self._open_log_file()
 			self._log_line(["# start", datetime.now().isoformat(timespec='seconds'), self.var_target_url.get().strip()])
+		# Reset artifacts
+		self.captured_artifacts = []
+		self._failures_captured = 0
 
 		# Start worker
 		self.is_running = True
@@ -2192,6 +2215,106 @@ class PasswordListGeneratorApp:
 			return params
 		except Exception:
 			return {}
+
+	def _run_prelogin_chain_sync(self, sess: requests.Session, cfg: dict, headers: dict | None, proxies: dict | None) -> None:
+		urls = cfg.get('prelogin', {}).get('urls') or []
+		for u in urls:
+			try:
+				sess.get(u, timeout=cfg.get('timeout', 15), headers=headers, proxies=proxies, allow_redirects=True)
+			except Exception:
+				pass
+		if cfg.get('prelogin', {}).get('headless_js'):
+			self._prelogin_js_sync(sess, urls[-1] if urls else cfg.get('_form_page_url') or cfg['url'])
+
+	def _maybe_capture_artifact(self, cfg: dict, user: str, pwd: str, method: str, url: str, headers: dict, params: dict, resp, success: bool, proxy: str | None, ua: str | None, latency_ms: int) -> None:
+		if not self.var_capture_enabled.get():
+			return
+		try:
+			if success is False:
+				if self._failures_captured >= int(self.var_capture_failures_n.get() or 0):
+					return
+				self._failures_captured += 1
+			max_n = int(self.var_capture_max_artifacts.get() or 0)
+			if max_n <= 0:
+				return
+			if len(self.captured_artifacts) >= max_n:
+				return
+			max_bytes = int(self.var_capture_max_bytes.get() or 65536)
+			# Build raw request
+			req_lines = [f"{method} {url} HTTP/1.1"]
+			for k,v in (headers or {}).items():
+				req_lines.append(f"{k}: {v}")
+			body = urlencode(params or {})
+			raw_req = "\n".join(req_lines) + ("\n\n" + body if body else "")
+			# Build raw response (truncate)
+			status = getattr(resp, 'status_code', '')
+			resp_headers = getattr(resp, 'headers', {}) or {}
+			rep_lines = [f"HTTP/1.1 {status}"]
+			for k,v in resp_headers.items():
+				rep_lines.append(f"{k}: {v}")
+			try:
+				text = resp.text if resp is not None else ""
+			except Exception:
+				text = ""
+			raw_resp = "\n".join(rep_lines) + "\n\n" + (text[:max_bytes] if text else "")
+			self.captured_artifacts.append({
+				"timestamp": datetime.now().isoformat(timespec='seconds'),
+				"user": user,
+				"password": pwd,
+				"method": method,
+				"url": url,
+				"headers": dict(headers or {}),
+				"params": dict(params or {}),
+				"status": status,
+				"latency_ms": latency_ms,
+				"proxy": proxy or "",
+				"ua": ua or "",
+				"raw_request": raw_req,
+				"raw_response": raw_resp,
+				"curl": self._build_curl(method, url, headers or {}, params or {}, proxy),
+			})
+		except Exception:
+			pass
+
+	def _build_curl(self, method: str, url: str, headers: dict, params: dict, proxy: str | None) -> str:
+		parts = ["curl", "-i", "-sS"]
+		if proxy:
+			parts += ["--proxy", proxy]
+		for k,v in (headers or {}).items():
+			parts += ["-H", f"{k}: {v}"]
+		if method.upper() == 'GET':
+			if params:
+				from urllib.parse import urlencode as _ue
+				qs = _ue(params)
+				url2 = url + ("&" if "?" in url else "?") + qs
+				parts += ["-X", "GET", url2]
+			else:
+				parts += ["-X", "GET", url]
+		else:
+			from urllib.parse import urlencode as _ue
+			data = _ue(params or {})
+			parts += ["-X", method.upper(), url, "--data", data]
+		return " ".join(parts)
+
+	def on_export_artifacts(self) -> None:
+		if not self.captured_artifacts:
+			messagebox.showinfo("Artifacts", "No captured artifacts to export.")
+			return
+		dirpath = filedialog.askdirectory()
+		if not dirpath:
+			return
+		try:
+			for i, a in enumerate(self.captured_artifacts, 1):
+				prefix = os.path.join(dirpath, f"artifact_{i:03d}")
+				with open(prefix + ".request.txt", 'w', encoding='utf-8') as f:
+					f.write(a.get('raw_request',''))
+				with open(prefix + ".response.txt", 'w', encoding='utf-8') as f:
+					f.write(a.get('raw_response',''))
+				with open(prefix + ".curl.sh", 'w', encoding='utf-8') as f:
+					f.write(a.get('curl',''))
+			self._append_preview(f"Exported {len(self.captured_artifacts)} artifacts to {dirpath}")
+		except Exception as exc:
+			messagebox.showerror("Export failed", str(exc))
 
 
 if __name__ == "__main__":
