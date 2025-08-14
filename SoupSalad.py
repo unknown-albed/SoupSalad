@@ -481,6 +481,45 @@ class PasswordListGeneratorApp:
 		self.btn_load = ttk.Button(actions2, text="Load Profile", command=self.on_load_profile)
 		self.btn_load.pack(side=tk.LEFT, padx=8)
 
+		# Flow Builder and Notes
+		self.var_flow_enabled = tk.BooleanVar(value=False)
+		self.var_flow_per_attempt = tk.BooleanVar(value=True)
+		self.flow_steps: list[dict] = []
+		self.var_wkhtmltopdf_path = tk.StringVar(value="wkhtmltopdf")
+
+		# Flow Builder
+		flow = ttk.LabelFrame(main, text="Flow Builder (pre-login multi-step)")
+		flow.pack(fill=tk.BOTH, expand=False, **padding)
+		rowf = 0
+		chk = ttk.Checkbutton(flow, text="Enable flow", variable=self.var_flow_enabled)
+		chk.grid(row=rowf, column=0, sticky="w", padx=4, pady=4)
+		chk2 = ttk.Checkbutton(flow, text="Run per attempt", variable=self.var_flow_per_attempt)
+		chk2.grid(row=rowf, column=1, sticky="w", padx=4, pady=4)
+		rowf += 1
+		cols = ("#", "method", "url", "extract")
+		self.flow_view = ttk.Treeview(flow, columns=cols, show='headings', height=5)
+		for c, w in zip(cols, (40, 80, 500, 200)):
+			self.flow_view.heading(c, text=c)
+			self.flow_view.column(c, width=w, anchor='w')
+		self.flow_view.grid(row=rowf, column=0, columnspan=8, sticky="we", padx=4)
+		rowf += 1
+		fb = ttk.Frame(flow)
+		fb.grid(row=rowf, column=0, columnspan=8, sticky="w")
+		ttk.Button(fb, text="Add GET", command=lambda: self.on_flow_add('GET')).pack(side=tk.LEFT, padx=4)
+		ttk.Button(fb, text="Add POST", command=lambda: self.on_flow_add('POST')).pack(side=tk.LEFT, padx=4)
+		ttk.Button(fb, text="Edit", command=self.on_flow_edit).pack(side=tk.LEFT, padx=12)
+		ttk.Button(fb, text="Remove", command=self.on_flow_remove).pack(side=tk.LEFT, padx=4)
+		ttk.Button(fb, text="Up", command=lambda: self.on_flow_move(-1)).pack(side=tk.LEFT, padx=12)
+		ttk.Button(fb, text="Down", command=lambda: self.on_flow_move(1)).pack(side=tk.LEFT, padx=4)
+		for i in range(0, 8):
+			flow.grid_columnconfigure(i, weight=1)
+
+		# Notes
+		notes = ttk.LabelFrame(main, text="Analyst Notes (included in HTML/PDF)")
+		notes.pack(fill=tk.BOTH, expand=True, **padding)
+		self.notes_text = scrolledtext.ScrolledText(notes, height=6)
+		self.notes_text.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
 	def _add_labeled_entry(self, master, label, var, row, col) -> None:
 		ttk.Label(master, text=label).grid(row=row, column=col, sticky="e", padx=4, pady=4)
 		entry = ttk.Entry(master, textvariable=var, width=28)
@@ -867,6 +906,12 @@ class PasswordListGeneratorApp:
 				"success_length_gt": int(self.var_success_length_gt.get() or 0),
 				# safe mode
 				"safe_auto_pause": bool(self.var_safe_auto_pause.get()),
+				# flow
+				"flow_enabled": bool(self.var_flow_enabled.get()),
+				"flow_per_attempt": bool(self.var_flow_per_attempt.get()),
+				"flow_steps": list(self.flow_steps),
+				# notes
+				"notes": self.notes_text.get('1.0','end-1c') if hasattr(self, 'notes_text') else "",
 			}
 
 		mode = self.var_mode.get()
@@ -1041,6 +1086,12 @@ class PasswordListGeneratorApp:
 			"success_length_gt": int(self.var_success_length_gt.get() or 0),
 			# safe mode
 			"safe_auto_pause": bool(self.var_safe_auto_pause.get()),
+			# flow
+			"flow_enabled": bool(self.var_flow_enabled.get()),
+			"flow_per_attempt": bool(self.var_flow_per_attempt.get()),
+			"flow_steps": list(self.flow_steps),
+			# notes
+			"notes": self.notes_text.get('1.0','end-1c') if hasattr(self, 'notes_text') else "",
 		}
 		path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("Profile JSON", "*.json"), ("All files", "*.*")])
 		if not path:
@@ -1165,6 +1216,15 @@ class PasswordListGeneratorApp:
 		self.var_safe_qps_cap.set(float(profile.get("safe_qps_cap", 1.0)))
 		self.var_safe_concurrency_cap.set(int(profile.get("safe_concurrency_cap", 2)))
 		self.var_safe_auto_pause.set(bool(profile.get("safe_auto_pause")))
+		# flow
+		self.var_flow_enabled.set(bool(profile.get("flow_enabled", False)))
+		self.var_flow_per_attempt.set(bool(profile.get("flow_per_attempt", True)))
+		self.flow_steps = list(profile.get("flow_steps", []))
+		self._refresh_flow_view()
+		# notes
+		if hasattr(self, 'notes_text'):
+			self.notes_text.delete('1.0', tk.END)
+			self.notes_text.insert('1.0', profile.get('notes', ''))
 
 		self._info("Profile loaded")
 
@@ -2268,6 +2328,7 @@ class PasswordListGeneratorApp:
 				d = int(now - t)
 				if 0 <= d < 60:
 					buckets[59 - d] += 1
+			notes_html = f"<h3>Analyst Notes</h3><pre>{html.escape(self.notes_text.get('1.0','end-1c'))}</pre>" if hasattr(self, 'notes_text') else ""
 			html = f"""
 			<!doctype html>
 			<html><head><meta charset='utf-8'>
@@ -2295,6 +2356,7 @@ class PasswordListGeneratorApp:
 				<h3>Requests per second (last 60s)</h3>
 				<canvas id='rpsChart' height='120'></canvas>
 			</div>
+			<div class='card' style='margin-top:16px;'>{notes_html}</div>
 			<script>
 			const data = {json.dumps(buckets)};
 			const ctx = document.getElementById('rpsChart').getContext('2d');
@@ -2592,7 +2654,8 @@ class PasswordListGeneratorApp:
 				d = int(now - t)
 				if 0 <= d < 60:
 					buckets[59 - d] += 1
-			html = f"<html><head><meta charset='utf-8'><script src='https://cdn.jsdelivr.net/npm/chart.js'></script></head><body><h1>Pentest Report</h1><pre>{json.dumps(s, indent=2)}</pre><canvas id='c' height='120'></canvas><script>const d={json.dumps(buckets)};new Chart(document.getElementById('c').getContext('2d'),{{type:'line',data:{{labels:d.map((_,i)=>i-59),datasets:[{{label:'RPS',data:d,borderColor:'#2a7',tension:0.25}}]}},options:{{plugins:{{legend:{{display:false}}}},scales:{{x:{{display:false}},y:{{beginAtZero:true}}}}}}}});</script></body></html>"
+			notes_html = f"<h3>Analyst Notes</h3><pre>{html.escape(self.notes_text.get('1.0','end-1c'))}</pre>" if hasattr(self, 'notes_text') else ""
+			html = f"<html><head><meta charset='utf-8'><script src='https://cdn.jsdelivr.net/npm/chart.js'></script></head><body><h1>Pentest Report</h1>{notes_html}<pre>{json.dumps(s, indent=2)}</pre><canvas id='c' height='120'></canvas><script>const d={json.dumps(buckets)};new Chart(document.getElementById('c').getContext('2d'),{{type:'line',data:{{labels:d.map((_,i)=>i-59),datasets:[{{label:'RPS',data:d,borderColor:'#2a7',tension:0.25}}]}},options:{{plugins:{{legend:{{display:false}}}},scales:{{x:{{display:false}},y:{{beginAtZero:true}}}}}}}});</script></body></html>"
 			with open(path_html, 'w', encoding='utf-8') as f:
 				f.write(html)
 			# JSON
@@ -2693,6 +2756,188 @@ class PasswordListGeneratorApp:
 				browser.close()
 		except Exception:
 			pass
+
+	def on_export_pdf(self) -> None:
+		# Build the same HTML as report and render to PDF via wkhtmltopdf
+		target = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF", "*.pdf"), ("All files", "*.*")])
+		if not target:
+			return
+		try:
+			import tempfile, subprocess, shutil
+			s = self._report_snapshot()
+			with self.metrics_lock:
+				ats = list(self.metrics["attempt_timestamps"])  # copy
+			now = time.time()
+			buckets = [0]*60
+			for t in ats:
+				d = int(now - t)
+				if 0 <= d < 60:
+					buckets[59 - d] += 1
+			notes_html = f"<h3>Analyst Notes</h3><pre>{html.escape(self.notes_text.get('1.0','end-1c'))}</pre>" if hasattr(self, 'notes_text') else ""
+			html_doc = f"""
+			<!doctype html><html><head><meta charset='utf-8'><title>Pentest Report</title>
+			<style>body{{font-family:sans-serif;margin:20px}} .grid{{display:grid;grid-template-columns:1fr 1fr;gap:16px}} .card{{border:1px solid #ddd;padding:12px;border-radius:8px}}</style>
+			</head><body>
+			<h1>Pentest Report</h1>
+			{notes_html}
+			<h3>Summary</h3><pre>{json.dumps(s, indent=2)}</pre>
+			</body></html>
+			"""
+			wk = self.var_wkhtmltopdf_path.get().strip() or 'wkhtmltopdf'
+			if not shutil.which(wk):
+				messagebox.showerror("wkhtmltopdf not found", "Install wkhtmltopdf and ensure it's in PATH, or set its path in settings.")
+				return
+			with tempfile.NamedTemporaryFile('w', suffix='.html', delete=False, encoding='utf-8') as tf:
+				html_path = tf.name
+				tf.write(html_doc)
+			cmd = [wk, html_path, target]
+			try:
+				subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+			finally:
+				try:
+					os.unlink(html_path)
+				except Exception:
+					pass
+			self._append_preview(f"Saved PDF to {target}")
+		except Exception as exc:
+			messagebox.showerror("Export failed", str(exc))
+
+	def on_flow_add(self, method: str) -> None:
+		self._open_flow_step_editor({"method": method, "url": "", "headers": {}, "body_mode": "params", "body": "", "extract_regex": "", "extract_var": ""})
+
+	def on_flow_edit(self) -> None:
+		item = self._selected_flow_index()
+		if item is None:
+			return
+		self._open_flow_step_editor(self.flow_steps[item], index=item)
+
+	def on_flow_remove(self) -> None:
+		item = self._selected_flow_index()
+		if item is None:
+			return
+		self.flow_steps.pop(item)
+		self._refresh_flow_view()
+
+	def on_flow_move(self, delta: int) -> None:
+		item = self._selected_flow_index()
+		if item is None:
+			return
+		new = max(0, min(len(self.flow_steps)-1, item + delta))
+		if new == item:
+			return
+		self.flow_steps[item], self.flow_steps[new] = self.flow_steps[new], self.flow_steps[item]
+		self._refresh_flow_view()
+		self.flow_view.selection_set(self.flow_view.get_children()[new])
+
+	def _selected_flow_index(self):
+		sel = self.flow_view.selection()
+		if not sel:
+			return None
+		return self.flow_view.index(sel[0])
+
+	def _open_flow_step_editor(self, step: dict, index: int | None = None) -> None:
+		win = tk.Toplevel(self.root)
+		win.title("Edit Flow Step")
+		row = 0
+		method_var = tk.StringVar(value=step.get('method','GET'))
+		url_var = tk.StringVar(value=step.get('url',''))
+		headers_var = tk.StringVar(value=json.dumps(step.get('headers') or {}))
+		body_mode_var = tk.StringVar(value=step.get('body_mode','params'))
+		body_text = scrolledtext.ScrolledText(win, height=6)
+		body_text.insert('1.0', step.get('body',''))
+		extract_regex_var = tk.StringVar(value=step.get('extract_regex',''))
+		extract_var_var = tk.StringVar(value=step.get('extract_var',''))
+		self._add_labeled_entry(win, "Method (GET/POST)", method_var, row=row, col=0); row += 1
+		self._add_labeled_entry(win, "URL (supports {{username}}, {{password}})", url_var, row=row, col=0); row += 1
+		self._add_labeled_entry(win, "Headers JSON", headers_var, row=row, col=0); row += 1
+		self._add_labeled_entry(win, "Body mode (params/json/raw)", body_mode_var, row=row, col=0); row += 1
+		lbl = ttk.Label(win, text="Body template (vars allowed)"); lbl.grid(row=row, column=0, sticky='w', padx=4, pady=2); row += 1
+		body_text.grid(row=row, column=0, columnspan=4, sticky='we', padx=4, pady=2); row += 1
+		self._add_labeled_entry(win, "Extract regex (optional)", extract_regex_var, row=row, col=0); row += 1
+		self._add_labeled_entry(win, "Extract var name", extract_var_var, row=row, col=0); row += 1
+		btnf = ttk.Frame(win); btnf.grid(row=row, column=0, sticky='w')
+		def save_and_close():
+			try:
+				new_step = {
+					"method": method_var.get().strip().upper() or 'GET',
+					"url": url_var.get().strip(),
+					"headers": json.loads(headers_var.get().strip() or '{}'),
+					"body_mode": body_mode_var.get().strip() or 'params',
+					"body": body_text.get('1.0','end-1c'),
+					"extract_regex": extract_regex_var.get().strip(),
+					"extract_var": extract_var_var.get().strip(),
+				}
+			except Exception as exc:
+				messagebox.showerror("Invalid step", str(exc)); return
+			if index is None:
+				self.flow_steps.append(new_step)
+			else:
+				self.flow_steps[index] = new_step
+			self._refresh_flow_view()
+			win.destroy()
+		ttk.Button(btnf, text="Save", command=save_and_close).pack(side=tk.LEFT, padx=4)
+		ttk.Button(btnf, text="Cancel", command=win.destroy).pack(side=tk.LEFT, padx=4)
+		for i in range(0, 4):
+			win.grid_columnconfigure(i, weight=1)
+
+	def _refresh_flow_view(self) -> None:
+		for i in self.flow_view.get_children():
+			self.flow_view.delete(i)
+		for idx, step in enumerate(self.flow_steps, 1):
+			self.flow_view.insert('', 'end', values=(idx, step.get('method',''), step.get('url',''), step.get('extract_var','')))
+
+	def _format_template(self, templ: str, context: dict) -> str:
+		try:
+			for k, v in context.items():
+				templ = templ.replace(f"{{{{{k}}}}}", str(v))
+			return templ
+		except Exception:
+			return templ
+
+	def _run_flow_sync(self, sess, cfg: dict, username: str, password: str) -> None:
+		context = {
+			"username": username,
+			"password": password,
+		}
+		for step_index, step in enumerate(self.flow_steps):
+			method = (step.get('method') or 'GET').upper()
+			url = self._format_template(step.get('url') or '', context)
+			if not url:
+				continue
+			headers = step.get('headers') or {}
+			body_mode = step.get('body_mode') or 'params'
+			body_templ = step.get('body') or ''
+			data = None
+			json_payload = None
+			if method == 'GET':
+				params = {}
+				if body_templ.strip():
+					# allow key=value&... or JSON
+					try:
+						params = dict(x.split('=',1) for x in self._format_template(body_templ, context).split('&') if '=' in x)
+					except Exception:
+						params = {}
+				resp = sess.get(url, params=params, timeout=cfg['timeout'], headers=headers)
+			else:
+				if body_mode == 'json':
+					try:
+						json_payload = json.loads(self._format_template(body_templ, context))
+					except Exception:
+						data = self._format_template(body_templ, context)
+				else:
+					data = self._format_template(body_templ, context)
+				resp = sess.post(url, json=json_payload, data=data if json_payload is None else None, timeout=cfg['timeout'], headers=headers)
+			# extract
+			re_pat = (step.get('extract_regex') or '').strip()
+			re_var = (step.get('extract_var') or '').strip()
+			if re_pat and re_var:
+				try:
+					m = re.search(re_pat, resp.text or '')
+					if m:
+						context[re_var] = m.group(1) if m.groups() else m.group(0)
+						self.ui_queue.put(("log", f"[Flow] Extracted {re_var}"))
+				except Exception as _exc:
+					self.ui_queue.put(("log", f"[Flow] Extract failed: {_exc}"))
 
 
 if __name__ == "__main__":
