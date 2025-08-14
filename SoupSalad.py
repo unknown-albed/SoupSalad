@@ -32,6 +32,11 @@ try:
 except Exception:
 	requests = None
 
+try:
+	import httpx
+except Exception:
+	httpx = None
+
 
 class RateLimiter:
 	def __init__(self, qps: float) -> None:
@@ -163,6 +168,13 @@ class PasswordListGeneratorApp:
 		self._log_fp = None
 		self._log_lock = threading.Lock()
 
+		# Engine (sync vs async)
+		self.var_async_engine = tk.BooleanVar(value=False)
+		self.var_http2 = tk.BooleanVar(value=True)
+		self.var_max_connections = tk.IntVar(value=100)
+		self.var_retries = tk.IntVar(value=2)
+		self.var_backoff_ms = tk.IntVar(value=200)
+
 		# Reporting UI variables
 		self.var_r_attempts = tk.StringVar(value="0")
 		self.var_r_successes = tk.StringVar(value="0")
@@ -261,6 +273,12 @@ class PasswordListGeneratorApp:
 		ttk.Button(target, text="Browse…", command=self.on_browse_user_agent_list_file).grid(row=8, column=4, sticky="w", padx=4, pady=4)
 		ttk.Label(target, text="UA rotation").grid(row=8, column=5, sticky="e", padx=4, pady=4)
 		ttk.Combobox(target, textvariable=self.var_user_agent_rotation, values=["per_request", "per_worker"], width=12, state="readonly").grid(row=8, column=6, sticky="w", padx=4, pady=4)
+		# Engine & pool config
+		ttk.Checkbutton(target, text="Async engine (httpx)", variable=self.var_async_engine).grid(row=9, column=0, sticky="w", padx=4, pady=4)
+		ttk.Checkbutton(target, text="HTTP/2", variable=self.var_http2).grid(row=9, column=1, sticky="w", padx=4, pady=4)
+		self._add_labeled_spinbox(target, "Max conns", self.var_max_connections, row=9, col=2, from_=1, to=1000)
+		self._add_labeled_spinbox(target, "Retries", self.var_retries, row=9, col=4, from_=0, to=10)
+		self._add_labeled_spinbox(target, "Backoff (ms)", self.var_backoff_ms, row=9, col=6, from_=0, to=5000)
 		for i in range(0, 9):
 			target.grid_columnconfigure(i, weight=1)
 
@@ -694,6 +712,12 @@ class PasswordListGeneratorApp:
 				"proxy_rotation": self.var_proxy_rotation.get(),
 				"user_agents": ua_list,
 				"ua_rotation": self.var_user_agent_rotation.get() if self.var_user_agent_rotate.get() else "none",
+				# async engine
+				"async_engine": bool(self.var_async_engine.get()),
+				"http2": bool(self.var_http2.get()),
+				"max_connections": int(self.var_max_connections.get() or 100),
+				"retries": int(self.var_retries.get() or 2),
+				"backoff_ms": int(self.var_backoff_ms.get() or 200),
 			}
 
 		mode = self.var_mode.get()
@@ -837,6 +861,12 @@ class PasswordListGeneratorApp:
 			"user_agent_rotate": self.var_user_agent_rotate.get(),
 			"user_agent_list_file": self.var_user_agent_list_file.get(),
 			"user_agent_rotation": self.var_user_agent_rotation.get(),
+			# async engine
+			"async_engine": self.var_async_engine.get(),
+			"http2": self.var_http2.get(),
+			"max_connections": self.var_max_connections.get(),
+			"retries": self.var_retries.get(),
+			"backoff_ms": self.var_backoff_ms.get(),
 		}
 		path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("Profile JSON", "*.json"), ("All files", "*.*")])
 		if not path:
@@ -930,6 +960,12 @@ class PasswordListGeneratorApp:
 		if self.var_user_agent_list_file.get():
 			self.loaded_user_agents = self._parse_list_file(self.var_user_agent_list_file.get())
 		self.var_user_agent_rotation.set(profile.get("user_agent_rotation", "per_request"))
+		# async engine
+		self.var_async_engine.set(bool(profile.get("async_engine", False)))
+		self.var_http2.set(bool(profile.get("http2", True)))
+		self.var_max_connections.set(int(profile.get("max_connections", 100)))
+		self.var_retries.set(int(profile.get("retries", 2)))
+		self.var_backoff_ms.set(int(profile.get("backoff_ms", 200)))
 
 		self._info("Profile loaded")
 
@@ -1425,20 +1461,25 @@ class PasswordListGeneratorApp:
 		total_ref = max(self.total_estimated, 1)
 
 		# Optional SQLi pre-checks (single-thread)
-		try:
-			base_sess = requests.Session()
-			self._configure_session(base_sess, cfg)
-			if cfg.get('enable_sqli'):
-				ok, msg = self._run_sqli_checks(base_sess, cfg)
-				if ok:
-					return completed, msg
-		except Exception as exc:
-			self.ui_queue.put(("log", f"Pentest setup error: {exc}"))
-		finally:
+		if cfg.get('async_engine') and httpx is not None:
+			ok, msg = self._run_async_sqli_checks(cfg)
+			if ok:
+				return completed, msg
+		else:
 			try:
-				base_sess.close()
-			except Exception:
-				pass
+				base_sess = requests.Session()
+				self._configure_session(base_sess, cfg)
+				if cfg.get('enable_sqli'):
+					ok, msg = self._run_sqli_checks(base_sess, cfg)
+					if ok:
+						return completed, msg
+			except Exception as exc:
+				self.ui_queue.put(("log", f"Pentest setup error: {exc}"))
+			finally:
+				try:
+					base_sess.close()
+				except Exception:
+					pass
 
 		# Shared lockout state
 		lockout_lock = threading.Lock()
