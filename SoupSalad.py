@@ -202,6 +202,13 @@ class PasswordListGeneratorApp:
 		self.var_prelogin_per_attempt = tk.BooleanVar(value=False)
 		self.var_prelogin_js = tk.BooleanVar(value=False)
 
+		# Request template
+		self.var_body_mode = tk.StringVar(value="params")  # params|json|raw
+		self.var_raw_body = tk.StringVar(value="")
+		# Success signals
+		self.var_success_require_redirect = tk.BooleanVar(value=False)
+		self.var_success_length_gt = tk.IntVar(value=0)
+
 		# Reporting UI variables
 		self.var_r_attempts = tk.StringVar(value="0")
 		self.var_r_successes = tk.StringVar(value="0")
@@ -396,6 +403,28 @@ class PasswordListGeneratorApp:
 		self.chart_canvas = tk.Canvas(chart_wrap, height=120, background="#ffffff", highlightthickness=1, highlightbackground="#ccc")
 		self.chart_canvas.grid(row=0, column=0, sticky="we")
 
+		# Request Template
+		rtpl = ttk.LabelFrame(main, text="Request Template")
+		rtpl.pack(fill=tk.BOTH, expand=False, **padding)
+		row2 = 0
+		ttk.Label(rtpl, text="Body mode").grid(row=row2, column=0, sticky="e", padx=4, pady=4)
+		mode_cb = ttk.Combobox(rtpl, textvariable=self.var_body_mode, values=["params","json","raw"], width=10, state="readonly")
+		mode_cb.grid(row=row2, column=1, sticky="w", padx=4, pady=4)
+		ttk.Label(rtpl, text="Raw body template ({{username}}, {{password}} supported)").grid(row=row2, column=2, sticky="w", padx=4, pady=4, columnspan=3)
+		row2 += 1
+		self.raw_body_text = scrolledtext.ScrolledText(rtpl, height=6)
+		self.raw_body_text.grid(row=row2, column=0, columnspan=6, sticky="we", padx=4, pady=4)
+		rtpl.grid_columnconfigure(5, weight=1)
+		row2 += 1
+		btns = ttk.Frame(rtpl)
+		btns.grid(row=row2, column=0, columnspan=6, sticky="w")
+		ttk.Button(btns, text="Import cURL (file)", command=self.on_import_curl_file).pack(side=tk.LEFT, padx=4)
+		ttk.Button(btns, text="Import Burp raw (file)", command=self.on_import_burp_file).pack(side=tk.LEFT, padx=4)
+		# Success signals
+		ttk.Checkbutton(btns, text="Require redirect", variable=self.var_success_require_redirect).pack(side=tk.LEFT, padx=12)
+		ttk.Label(btns, text="Length >= ").pack(side=tk.LEFT)
+		spinLen = ttk.Spinbox(btns, textvariable=self.var_success_length_gt, from_=0, to=10_000_000, width=8)
+		spinLen.pack(side=tk.LEFT, padx=4)
 		# Reporting actions
 		actions = ttk.Frame(report)
 		actions.grid(row=row+1, column=0, columnspan=3, sticky="we", pady=(8,0))
@@ -789,6 +818,12 @@ class PasswordListGeneratorApp:
 					"per_attempt": bool(self.var_prelogin_per_attempt.get()),
 					"headless_js": bool(self.var_prelogin_js.get()),
 				},
+				# template
+				"body_mode": self.var_body_mode.get(),
+				"raw_body": self.raw_body_text.get("1.0", 'end-1c'),
+				# success signals
+				"success_require_redirect": bool(self.var_success_require_redirect.get()),
+				"success_length_gt": int(self.var_success_length_gt.get() or 0),
 			}
 
 		mode = self.var_mode.get()
@@ -956,6 +991,11 @@ class PasswordListGeneratorApp:
 				"per_attempt": bool(self.var_prelogin_per_attempt.get()),
 				"headless_js": bool(self.var_prelogin_js.get()),
 			},
+			# template and success signals
+			"body_mode": self.var_body_mode.get(),
+			"raw_body": self.raw_body_text.get("1.0", 'end-1c'),
+			"success_require_redirect": bool(self.var_success_require_redirect.get()),
+			"success_length_gt": int(self.var_success_length_gt.get() or 0),
 		}
 		path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("Profile JSON", "*.json"), ("All files", "*.*")])
 		if not path:
@@ -1069,6 +1109,11 @@ class PasswordListGeneratorApp:
 		)
 		self.var_prelogin_per_attempt.set(bool(profile.get("prelogin", {}).get("per_attempt")))
 		self.var_prelogin_js.set(bool(profile.get("prelogin", {}).get("headless_js")))
+		# template and success signals
+		self.var_body_mode.set(profile.get("body_mode", "params"))
+		self.raw_body_text.delete('1.0', tk.END); self.raw_body_text.insert(tk.END, profile.get("raw_body", ""))
+		self.var_success_require_redirect.set(bool(profile.get("success_require_redirect", False)))
+		self.var_success_length_gt.set(int(profile.get("success_length_gt", 0)))
 
 		self._info("Profile loaded")
 
@@ -1472,12 +1517,39 @@ class PasswordListGeneratorApp:
 		extra = dict(cfg.get('extra_params', {}))
 		if call_params_extra:
 			extra.update(call_params_extra)
-		data = {user_param: username, pass_param: password, **extra}
+		# Build payload depending on mode
+		body_mode = cfg.get('body_mode', 'params')
+		raw_body = cfg.get('raw_body', '')
+		data = None
+		json_payload = None
+		if body_mode == 'params' or method.upper() == 'GET':
+			data = {user_param: username, pass_param: password, **extra}
+		else:
+			# replace placeholders
+			templ = (raw_body or '')
+			try:
+				for k,v in {"username": username, "password": password}.items():
+					templ = templ.replace(f"{{{{{k}}}}}", v)
+				# also replace extra params if present
+				for k,v in extra.items():
+					templ = templ.replace(f"{{{{{k}}}}}", str(v))
+			except Exception:
+				pass
+			if body_mode == 'json':
+				try:
+					json_payload = json.loads(templ)
+				except Exception:
+					data = templ
+			else:
+				data = templ
 		try:
 			if method == 'GET':
 				resp = sess.get(url, params=data, timeout=cfg['timeout'], headers=call_headers, proxies=call_proxies)
 			else:
-				resp = sess.post(url, data=data, timeout=cfg['timeout'], headers=call_headers, proxies=call_proxies)
+				if json_payload is not None:
+					resp = sess.post(url, json=json_payload, timeout=cfg['timeout'], headers=call_headers, proxies=call_proxies)
+				else:
+					resp = sess.post(url, data=data, timeout=cfg['timeout'], headers=call_headers, proxies=call_proxies)
 			return resp
 		except Exception as exc:
 			self.ui_queue.put(("log", f"Request error: {exc}"))
@@ -1492,8 +1564,15 @@ class PasswordListGeneratorApp:
 		succ_re = cfg.get('success_regex')
 		if fail_re and fail_re.search(text):
 			return False
-		if succ_re:
-			return bool(succ_re.search(text))
+		if succ_re and not succ_re.search(text):
+			return False
+		# Redirect requirement
+		if cfg.get('success_require_redirect') and not (300 <= resp.status_code < 400):
+			return False
+		# Length threshold
+		min_len = int(cfg.get('success_length_gt') or 0)
+		if min_len > 0 and len(text) < min_len:
+			return False
 		return status_ok
 
 	def _is_lockout(self, resp, cfg: dict) -> bool:
@@ -2315,6 +2394,131 @@ class PasswordListGeneratorApp:
 			self._append_preview(f"Exported {len(self.captured_artifacts)} artifacts to {dirpath}")
 		except Exception as exc:
 			messagebox.showerror("Export failed", str(exc))
+
+	def on_import_curl_file(self) -> None:
+		path = filedialog.askopenfilename(filetypes=[("All", "*.*")])
+		if not path:
+			return
+		try:
+			with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+				cmd = f.read()
+			cfg = self._parse_curl(cmd)
+			self._apply_imported_request(cfg)
+		except Exception as exc:
+			messagebox.showerror("Import failed", str(exc))
+
+	def on_import_burp_file(self) -> None:
+		path = filedialog.askopenfilename(filetypes=[("All", "*.*")])
+		if not path:
+			return
+		try:
+			with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+				raw = f.read()
+			cfg = self._parse_burp_raw(raw)
+			self._apply_imported_request(cfg)
+		except Exception as exc:
+			messagebox.showerror("Import failed", str(exc))
+
+	def _apply_imported_request(self, imp: dict) -> None:
+		if not imp:
+			return
+		# Set fields
+		self.var_http_method.set(imp.get('method', self.var_http_method.get()))
+		self.var_target_url.set(imp.get('url', self.var_target_url.get()))
+		# headers
+		try:
+			self.var_headers_json.set(json.dumps(imp.get('headers', {}), indent=0))
+		except Exception:
+			pass
+		# body
+		self.var_body_mode.set(imp.get('body_mode', self.var_body_mode.get()))
+		self.raw_body_text.delete('1.0', tk.END)
+		self.raw_body_text.insert(tk.END, imp.get('raw_body', ''))
+		# params
+		extra = imp.get('params', {})
+		if extra:
+			self.var_extra_params.set("&".join(f"{k}={v}" for k,v in extra.items()))
+		# attempt to set param names if guessed
+		if imp.get('user_param'):
+			self.var_user_param.set(imp['user_param'])
+		if imp.get('pass_param'):
+			self.var_pass_param.set(imp['pass_param'])
+
+	def _parse_curl(self, cmd: str) -> dict:
+		import shlex
+		args = shlex.split(cmd)
+		imp = {"headers": {}, "params": {}, "body_mode": "params", "raw_body": ""}
+		it = iter(args)
+		url = None; method = None; data = None
+		for token in it:
+			if token.lower() == 'curl':
+				continue
+			if token == '-X':
+				method = next(it, None)
+			elif token in ('-H','--header'):
+				h = next(it, '')
+				if ':' in h:
+					k,v = h.split(':',1); imp['headers'][k.strip()] = v.strip()
+			elif token.startswith('http'):
+				url = token
+			elif token in ('--data','--data-raw','--data-binary','--data-urlencode','-d'):
+				data = next(it, '')
+		# body detection
+		ct = (imp['headers'].get('Content-Type') or imp['headers'].get('content-type') or '').lower()
+		if data:
+			if 'application/json' in ct:
+				imp['body_mode'] = 'json'; imp['raw_body'] = data
+			else:
+				imp['body_mode'] = 'raw'; imp['raw_body'] = data
+		imp['url'] = url or ''
+		imp['method'] = method or 'POST'
+		# try param names guess
+		imp['user_param'] = self.var_user_param.get()
+		imp['pass_param'] = self.var_pass_param.get()
+		return imp
+
+	def _parse_burp_raw(self, raw: str) -> dict:
+		lines = raw.splitlines()
+		if not lines:
+			return {}
+		req_line = lines[0]
+		method, path, _ = req_line.split(' ',2)
+		headers = {}
+		body = ""
+		host = None
+		sep = lines.index('') if '' in lines else len(lines)
+		for h in lines[1:sep]:
+			if ':' in h:
+				k,v = h.split(':',1); headers[k.strip()] = v.strip()
+		host = headers.get('Host') or headers.get('host')
+		if sep < len(lines)-1:
+			body = "\n".join(lines[sep+1:])
+		protocol = 'https' if headers.get('X-Forwarded-Proto','').lower()=='https' else 'http'
+		url = f"{protocol}://{host}{path}" if host else path
+		imp = {"method": method, "url": url, "headers": headers, "params": {}, "body_mode": "params", "raw_body": ""}
+		ct = (headers.get('Content-Type') or headers.get('content-type') or '').lower()
+		if body:
+			if 'application/json' in ct:
+				imp['body_mode'] = 'json'; imp['raw_body'] = body
+			elif 'application/x-www-form-urlencoded' in ct:
+				imp['body_mode'] = 'params'
+				try:
+					from urllib.parse import parse_qsl
+					imp['params'] = dict(parse_qsl(body, keep_blank_values=True))
+				except Exception:
+					pass
+			else:
+				imp['body_mode'] = 'raw'; imp['raw_body'] = body
+		# guess param names
+		for k in ('username','user','email','login'):
+			if k in (imp['params'] or {}):
+				imp['user_param'] = k
+				break
+		for k in ('password','pass','pwd'):
+			if k in (imp['params'] or {}):
+				imp['pass_param'] = k
+				break
+		return imp
 
 
 if __name__ == "__main__":
