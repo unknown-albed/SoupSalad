@@ -266,6 +266,10 @@ class PasswordListGeneratorApp:
 		self.var_intruder_markers = tk.StringVar(value="§PAYLOAD§")
 		self.intruder_sets_text = tk.StringVar(value="")  # lines: MARKER=source
 
+		# Intruder results UI state
+		self.intr_results: list[dict] = []
+		self.intr_baseline: dict | None = None
+
 	def _default_output_path(self) -> str:
 		timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 		base = f"Passwordlist-{timestamp}.txt"
@@ -577,6 +581,13 @@ class PasswordListGeneratorApp:
 		pp.pack(side=tk.LEFT, padx=4)
 		dd = ttk.Button(btn_row, text="Download seclists…", command=self.on_download_seclists)
 		dd.pack(side=tk.LEFT, padx=4)
+		# Results grid
+		cols = ("#", "combo", "status", "len", "+/-", "ms", "succ", "fail")
+		self.intr_view = ttk.Treeview(intr, columns=cols, show='headings', height=6)
+		for c, w in zip(cols, (50, 420, 70, 70, 70, 70, 60, 60)):
+			self.intr_view.heading(c, text=c)
+			self.intr_view.column(c, width=w, anchor='w')
+		self.intr_view.grid(row=5, column=0, columnspan=8, sticky='we', padx=4, pady=4)
 		for i in range(0, 8):
 			intr.grid_columnconfigure(i, weight=1)
 
@@ -621,10 +632,16 @@ class PasswordListGeneratorApp:
 				elif item[0] == "message":
 					_, msg = item
 					self.status_var.set(msg)
+				elif item[0] == "intruder_result":
+					row = item[1]
+					self.intr_results.append(row)
+					try:
+						self.intr_view.insert('', 'end', values=(row.get('idx'), str(row.get('combo')), row.get('status'), row.get('len'), row.get('delta'), row.get('ms'), row.get('succ'), row.get('fail')))
+					except Exception:
+						pass
 		except queue.Empty:
 			pass
-		finally:
-			self.root.after(100, self._process_ui_queue)
+		self.root.after(150, self._process_ui_queue)
 
 	def _append_preview(self, line: str) -> None:
 		self.preview_text.configure(state=tk.NORMAL)
@@ -1744,7 +1761,7 @@ class PasswordListGeneratorApp:
 					marker = cfg.get('intruder_marker') or ''
 					if marker:
 						url = url.replace(marker, str(ipl))
-				resp = sess.get(url, params=data, timeout=cfg['timeout'], headers=call_headers, proxies=call_proxies, auth=self._build_http_auth(cfg))
+				resp = sess.get(url, params=data, timeout=cfg['timeout'], headers=call_headers, proxies=call_proxies, auth=self._build_http_auth(cfg, username, password))
 			else:
 				if cfg.get('flow_enabled') and cfg.get('flow_per_attempt') and self.flow_steps:
 					try:
@@ -1771,9 +1788,9 @@ class PasswordListGeneratorApp:
 					except Exception:
 						pass
 				if json_payload is not None:
-					resp = sess.post(url, json=json_payload, timeout=cfg['timeout'], headers=call_headers, proxies=call_proxies, auth=self._build_http_auth(cfg))
+					resp = sess.post(url, json=json_payload, timeout=cfg['timeout'], headers=call_headers, proxies=call_proxies, auth=self._build_http_auth(cfg, username, password))
 				else:
-					resp = sess.post(url, data=data, timeout=cfg['timeout'], headers=call_headers, proxies=call_proxies, auth=self._build_http_auth(cfg))
+					resp = sess.post(url, data=data, timeout=cfg['timeout'], headers=call_headers, proxies=call_proxies, auth=self._build_http_auth(cfg, username, password))
 			return resp
 		except Exception as exc:
 			self.ui_queue.put(("log", f"Request error: {exc}"))
@@ -3057,10 +3074,10 @@ class PasswordListGeneratorApp:
 		except Exception:
 			self.flow_context_last = {}
 
-	def _build_http_auth(self, cfg: dict):
+	def _build_http_auth(self, cfg: dict, attempt_user: str | None = None, attempt_pwd: str | None = None):
 		atype = (cfg.get('auth_type') or 'None').strip()
-		user = cfg.get('auth_user') or ''
-		pwd = cfg.get('auth_pass') or ''
+		user = attempt_user if attempt_user is not None else (cfg.get('auth_user') or '')
+		pwd = attempt_pwd if attempt_pwd is not None else (cfg.get('auth_pass') or '')
 		domain = cfg.get('auth_domain') or ''
 		if atype == 'Basic':
 			return (user, pwd)
@@ -3233,6 +3250,8 @@ class PasswordListGeneratorApp:
 						if count >= max_combos:
 							self.ui_queue.put(("log", f"[Intruder] Reached max combos cap {max_combos}") )
 							break
+			baseline_len = None
+			baseline_status = None
 			for combo in iter_combos():
 				if self.cancel_requested:
 					break
@@ -3244,8 +3263,34 @@ class PasswordListGeneratorApp:
 					resp = self._http_attempt(sess, cfg, username="", password="", call_headers=None, call_proxies=None, call_params_extra=None)
 					lat = int((time.time() - t0) * 1000)
 					ok = self._is_success(resp, cfg)
-					self._record_attempt(ok, resp.status_code if resp else 0, lat)
+					code = getattr(resp, 'status_code', 0)
+					text_len = len(getattr(resp, 'text', '') or '') if resp is not None else 0
+					if baseline_len is None:
+						baseline_len = text_len
+						baseline_status = code
+					self._record_attempt(ok, code, lat)
 					self._maybe_capture_artifact(cfg, resp, username=f"INTRUDER:{combo}", password="", extra_notes="intruder")
+					# Post result to UI
+					try:
+						fail_re = cfg.get('failure_regex')
+						succ_re = cfg.get('success_regex')
+						text = getattr(resp, 'text', '') or ''
+						matched_fail = bool(fail_re and fail_re.search(text))
+						matched_succ = bool(succ_re and succ_re.search(text))
+						delta = text_len - (baseline_len or 0)
+						row = {
+							"idx": idx,
+							"combo": combo,
+							"status": code,
+							"len": text_len,
+							"delta": delta,
+							"ms": lat,
+							"succ": int(matched_succ),
+							"fail": int(matched_fail),
+						}
+						self.ui_queue.put(("intruder_result", row))
+					except Exception:
+						pass
 					if ok:
 						self.ui_queue.put(("log", f"[Intruder] Potential hit with combo: {combo}"))
 				except Exception as exc:
