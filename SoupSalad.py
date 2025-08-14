@@ -188,6 +188,12 @@ class PasswordListGeneratorApp:
 		self.var_auto_form = tk.BooleanVar(value=False)
 		self.var_refresh_csrf = tk.BooleanVar(value=False)
 
+		# Pre-login chain
+		self.var_prelogin_enabled = tk.BooleanVar(value=False)
+		self.var_prelogin_urls = tk.StringVar(value="")  # comma-separated URLs
+		self.var_prelogin_per_attempt = tk.BooleanVar(value=False)
+		self.var_prelogin_js = tk.BooleanVar(value=False)
+
 		# Reporting UI variables
 		self.var_r_attempts = tk.StringVar(value="0")
 		self.var_r_successes = tk.StringVar(value="0")
@@ -304,6 +310,10 @@ class PasswordListGeneratorApp:
 		ttk.Checkbutton(ck, text="Resume from checkpoint", variable=self.var_resume_from_checkpoint).grid(row=0, column=4, sticky="w", padx=4, pady=4)
 		ttk.Checkbutton(ck, text="Auto-discover form/CSRF", variable=self.var_auto_form).grid(row=1, column=0, sticky="w", padx=4, pady=4)
 		ttk.Checkbutton(ck, text="Refresh CSRF each attempt", variable=self.var_refresh_csrf).grid(row=1, column=1, sticky="w", padx=4, pady=4)
+		self._add_labeled_entry(ck, "Pre-login URLs (comma)", self.var_prelogin_urls, row=1, col=2)
+		ttk.Checkbutton(ck, text="Enable pre-login", variable=self.var_prelogin_enabled).grid(row=1, column=4, sticky="w", padx=4, pady=4)
+		ttk.Checkbutton(ck, text="Per attempt", variable=self.var_prelogin_per_attempt).grid(row=1, column=5, sticky="w", padx=4, pady=4)
+		ttk.Checkbutton(ck, text="Headless JS", variable=self.var_prelogin_js).grid(row=1, column=6, sticky="w", padx=4, pady=4)
 		for i in range(0, 5):
 			ck.grid_columnconfigure(i, weight=1)
 
@@ -752,6 +762,13 @@ class PasswordListGeneratorApp:
 				},
 				"auto_form": bool(self.var_auto_form.get()),
 				"refresh_csrf": bool(self.var_refresh_csrf.get()),
+				# pre-login
+				"prelogin": {
+					"enabled": bool(self.var_prelogin_enabled.get()),
+					"urls": [u.strip() for u in (self.var_prelogin_urls.get() or '').split(',') if u.strip()],
+					"per_attempt": bool(self.var_prelogin_per_attempt.get()),
+					"headless_js": bool(self.var_prelogin_js.get()),
+				},
 			}
 
 		mode = self.var_mode.get()
@@ -909,6 +926,13 @@ class PasswordListGeneratorApp:
 			},
 			"auto_form": bool(self.var_auto_form.get()),
 			"refresh_csrf": bool(self.var_refresh_csrf.get()),
+			# pre-login
+			"prelogin": {
+				"enabled": bool(self.var_prelogin_enabled.get()),
+				"urls": [u.strip() for u in (self.var_prelogin_urls.get() or '').split(',') if u.strip()],
+				"per_attempt": bool(self.var_prelogin_per_attempt.get()),
+				"headless_js": bool(self.var_prelogin_js.get()),
+			},
 		}
 		path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("Profile JSON", "*.json"), ("All files", "*.*")])
 		if not path:
@@ -1015,6 +1039,13 @@ class PasswordListGeneratorApp:
 		# auto form
 		self.var_auto_form.set(bool(profile.get("auto_form")))
 		self.var_refresh_csrf.set(bool(profile.get("refresh_csrf")))
+		# pre-login
+		self.var_prelogin_enabled.set(bool(profile.get("prelogin", {}).get("enabled")))
+		self.var_prelogin_urls.set(
+			", ".join(profile.get("prelogin", {}).get("urls", []))
+		)
+		self.var_prelogin_per_attempt.set(bool(profile.get("prelogin", {}).get("per_attempt")))
+		self.var_prelogin_js.set(bool(profile.get("prelogin", {}).get("headless_js")))
 
 		self._info("Profile loaded")
 
