@@ -175,6 +175,19 @@ class PasswordListGeneratorApp:
 		self.var_retries = tk.IntVar(value=2)
 		self.var_backoff_ms = tk.IntVar(value=200)
 
+		# Checkpoint/resume
+		self.var_checkpoint_enabled = tk.BooleanVar(value=False)
+		self.var_checkpoint_file = tk.StringVar(value="")
+		self.var_resume_from_checkpoint = tk.BooleanVar(value=False)
+		self._checkpoint_lock = threading.Lock()
+		self._last_checkpoint_ts = 0.0
+		self._checkpoint_every_attempts = 200
+		self._resume_state = None
+
+		# Auto form/CSRF
+		self.var_auto_form = tk.BooleanVar(value=False)
+		self.var_refresh_csrf = tk.BooleanVar(value=False)
+
 		# Reporting UI variables
 		self.var_r_attempts = tk.StringVar(value="0")
 		self.var_r_successes = tk.StringVar(value="0")
@@ -282,6 +295,18 @@ class PasswordListGeneratorApp:
 		for i in range(0, 9):
 			target.grid_columnconfigure(i, weight=1)
 
+		# Checkpoint & Auto-form
+		ck = ttk.LabelFrame(main, text="Checkpoint & Form Discovery")
+		ck.pack(fill=tk.X, **padding)
+		ttk.Checkbutton(ck, text="Enable checkpoint", variable=self.var_checkpoint_enabled).grid(row=0, column=0, sticky="w", padx=4, pady=4)
+		self._add_labeled_entry(ck, "File", self.var_checkpoint_file, row=0, col=1)
+		ttk.Button(ck, text="Browse…", command=self.on_browse_checkpoint_file).grid(row=0, column=3, sticky="w", padx=4, pady=4)
+		ttk.Checkbutton(ck, text="Resume from checkpoint", variable=self.var_resume_from_checkpoint).grid(row=0, column=4, sticky="w", padx=4, pady=4)
+		ttk.Checkbutton(ck, text="Auto-discover form/CSRF", variable=self.var_auto_form).grid(row=1, column=0, sticky="w", padx=4, pady=4)
+		ttk.Checkbutton(ck, text="Refresh CSRF each attempt", variable=self.var_refresh_csrf).grid(row=1, column=1, sticky="w", padx=4, pady=4)
+		for i in range(0, 5):
+			ck.grid_columnconfigure(i, weight=1)
+
 		# Usernames & Spray controls
 		users = ttk.LabelFrame(main, text="Usernames & Password Spraying")
 		users.pack(fill=tk.X, **padding)
@@ -359,6 +384,7 @@ class PasswordListGeneratorApp:
 		ttk.Button(actions, text="Export JSON", command=self.on_export_report_json).pack(side=tk.LEFT)
 		tkbtn = ttk.Button(actions, text="Export CSV", command=self.on_export_report_csv)
 		tkbtn.pack(side=tk.LEFT, padx=8)
+		ttk.Button(actions, text="Export HTML", command=self.on_export_report_html).pack(side=tk.LEFT, padx=8)
 		# Logging controls
 		ttk.Checkbutton(actions, text="Log to file", variable=self.var_log_to_file).pack(side=tk.LEFT, padx=12)
 		log_entry = ttk.Entry(actions, textvariable=self.var_log_file, width=48)
@@ -718,6 +744,14 @@ class PasswordListGeneratorApp:
 				"max_connections": int(self.var_max_connections.get() or 100),
 				"retries": int(self.var_retries.get() or 2),
 				"backoff_ms": int(self.var_backoff_ms.get() or 200),
+				# checkpoint & auto form
+				"checkpoint": {
+					"enabled": bool(self.var_checkpoint_enabled.get()),
+					"file": self.var_checkpoint_file.get().strip(),
+					"resume": bool(self.var_resume_from_checkpoint.get()),
+				},
+				"auto_form": bool(self.var_auto_form.get()),
+				"refresh_csrf": bool(self.var_refresh_csrf.get()),
 			}
 
 		mode = self.var_mode.get()
@@ -867,6 +901,14 @@ class PasswordListGeneratorApp:
 			"max_connections": self.var_max_connections.get(),
 			"retries": self.var_retries.get(),
 			"backoff_ms": self.var_backoff_ms.get(),
+			# checkpoint & auto form
+			"checkpoint": {
+				"enabled": bool(self.var_checkpoint_enabled.get()),
+				"file": self.var_checkpoint_file.get().strip(),
+				"resume": bool(self.var_resume_from_checkpoint.get()),
+			},
+			"auto_form": bool(self.var_auto_form.get()),
+			"refresh_csrf": bool(self.var_refresh_csrf.get()),
 		}
 		path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("Profile JSON", "*.json"), ("All files", "*.*")])
 		if not path:
@@ -966,6 +1008,13 @@ class PasswordListGeneratorApp:
 		self.var_max_connections.set(int(profile.get("max_connections", 100)))
 		self.var_retries.set(int(profile.get("retries", 2)))
 		self.var_backoff_ms.set(int(profile.get("backoff_ms", 200)))
+		# checkpoint & auto form
+		self.var_checkpoint_enabled.set(bool(profile.get("checkpoint", {}).get("enabled")))
+		self.var_checkpoint_file.set(profile.get("checkpoint", {}).get("file", ""))
+		self.var_resume_from_checkpoint.set(bool(profile.get("checkpoint", {}).get("resume")))
+		# auto form
+		self.var_auto_form.set(bool(profile.get("auto_form")))
+		self.var_refresh_csrf.set(bool(profile.get("refresh_csrf")))
 
 		self._info("Profile loaded")
 
@@ -1520,6 +1569,15 @@ class PasswordListGeneratorApp:
 			ua_cycle_lock = threading.Lock()
 			proxy_index = [0]
 			ua_index = [0]
+			use_async = bool(cfg.get('async_engine')) and (httpx is not None)
+			# resume indices (only for spraying)
+			resume_pwd_idx = 0
+			resume_user_idx = 0
+			if cfg.get('checkpoint', {}).get('resume') and cfg.get('checkpoint', {}).get('enabled'):
+				state = self._load_checkpoint(cfg)
+				if state and state.get('spray'):
+					resume_pwd_idx = int(state.get('pwd_idx', 0))
+					resume_user_idx = int(state.get('user_idx', 0))
 
 			def build_proxies_dict(proxy_url: str | None):
 				if not proxy_url:
@@ -1567,7 +1625,22 @@ class PasswordListGeneratorApp:
 
 			def producer():
 				try:
-					for pair in pair_iterable:
+					# Wrap pair_iterable to apply resume for spraying
+					it = pair_iterable
+					if cfg.get('spray_enabled'):
+						usernames = cfg.get('usernames', [])
+						passwords = cfg.get('spray_passwords', [])
+						def gen_pairs():
+							for pi, pwd in enumerate(passwords):
+								if pi < resume_pwd_idx:
+									continue
+								start_ui = resume_user_idx if pi == resume_pwd_idx else 0
+								for ui, user in enumerate(usernames):
+									if ui < start_ui:
+										continue
+									yield (user, pwd)
+						it = gen_pairs()
+					for pair in it:
 						if self.cancel_requested or stop_event.is_set():
 							break
 						try:
@@ -1693,6 +1766,12 @@ class PasswordListGeneratorApp:
 						if self.cancel_requested:
 							break
 						time.sleep(0.5)
+				# Save checkpoint at end of each password round
+				if cfg.get('checkpoint', {}).get('enabled') and cfg.get('spray_enabled'):
+					try:
+						self._save_checkpoint(cfg, (cfg.get('spray_passwords', []).index(pwd) + 1), 0)
+					except Exception:
+						pass
 		else:
 			# Not spraying: iterate password candidates for a single/fixed username list (first one)
 			fixed_users = cfg.get('usernames', []) or [cfg.get('username')]
@@ -1848,6 +1927,156 @@ class PasswordListGeneratorApp:
 					self.root.destroy()
 				except Exception:
 					os._exit(1)
+
+	def _apply_form_autodiscovery(self, cfg: dict) -> dict:
+		# Fetch URL, parse form to determine action, method, fields
+		from html.parser import HTMLParser
+		try:
+			from bs4 import BeautifulSoup
+		except Exception:
+			BeautifulSoup = None
+		def fetch(url):
+			try:
+				resp = requests.get(url, timeout=cfg.get('timeout', 15), verify=cfg.get('verify', True))
+				return resp
+			except Exception as exc:
+				self.ui_queue.put(("log", f"[Form] fetch error: {exc}"))
+				return None
+		resp = fetch(cfg['url'])
+		if resp is None or not resp.text:
+			return cfg
+		html = resp.text
+		form_info = None
+		if BeautifulSoup is not None:
+			soup = BeautifulSoup(html, 'html.parser')
+			forms = soup.find_all('form')
+			candidates = []
+			for f in forms:
+				inputs = f.find_all('input')
+				names = {i.get('name','').lower() for i in inputs}
+				if any(n in names for n in ['username','user','email','login']) and any(n in names for n in ['password','pass','pwd']):
+					candidates.append(f)
+			if candidates:
+				f = candidates[0]
+				action = f.get('action') or cfg['url']
+				method = (f.get('method') or cfg['method']).upper()
+				hidden = {i.get('name'): i.get('value','') for i in f.find_all('input', {'type':'hidden'}) if i.get('name')}
+				# Guess param names
+				up = cfg['user_param']
+				pp = cfg['pass_param']
+				for i in f.find_all('input'):
+					name = (i.get('name') or '').lower()
+					if name in ['username','user','email','login']:
+						up = i.get('name')
+					if name in ['password','pass','pwd']:
+						pp = i.get('name')
+				# Resolve URL
+				from urllib.parse import urljoin
+				new_url = urljoin(cfg['url'], action)
+				cfg = dict(cfg)
+				cfg['url'] = new_url
+				cfg['method'] = method
+				cfg['user_param'] = up
+				cfg['pass_param'] = pp
+				extra = dict(cfg.get('extra_params') or {})
+				extra.update(hidden)
+				cfg['extra_params'] = extra
+				# CSRF token name heuristic
+				for k in hidden.keys():
+					if any(tok in k.lower() for tok in ['csrf','token','authenticity']):
+						cfg['_csrf_field'] = k
+						break
+		return cfg
+
+	def _save_checkpoint(self, cfg: dict, pwd_idx: int, user_idx: int) -> None:
+		try:
+			if not cfg.get('checkpoint', {}).get('enabled'):
+				return
+			path = cfg.get('checkpoint', {}).get('file') or ''
+			if not path:
+				return
+			state = {
+				"spray": bool(cfg.get('spray_enabled')),
+				"pwd_idx": int(pwd_idx),
+				"user_idx": int(user_idx),
+				"ts": time.time(),
+			}
+			with self._checkpoint_lock:
+				with open(path, 'w', encoding='utf-8') as f:
+					json.dump(state, f)
+		except Exception:
+			pass
+
+	def _load_checkpoint(self, cfg: dict):
+		try:
+			path = cfg.get('checkpoint', {}).get('file') or ''
+			if not path or not os.path.exists(path):
+				return None
+			with open(path, 'r', encoding='utf-8') as f:
+				return json.load(f)
+		except Exception:
+			return None
+
+	def on_browse_checkpoint_file(self) -> None:
+		path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json"), ("All files", "*.*")])
+		if not path:
+			return
+		self.var_checkpoint_file.set(path)
+
+	def on_export_report_html(self) -> None:
+		s = self._report_snapshot()
+		path = filedialog.asksaveasfilename(defaultextension=".html", filetypes=[("HTML", "*.html"), ("All files", "*.*")])
+		if not path:
+			return
+		try:
+			# Build RPS buckets last 60s
+			with self.metrics_lock:
+				ats = list(self.metrics["attempt_timestamps"])  # copy
+			now = time.time()
+			buckets = [0]*60
+			for t in ats:
+				d = int(now - t)
+				if 0 <= d < 60:
+					buckets[59 - d] += 1
+			html = f"""
+			<!doctype html>
+			<html><head><meta charset='utf-8'>
+			<title>Pentest Report</title>
+			<script src='https://cdn.jsdelivr.net/npm/chart.js'></script>
+			<style>body{{font-family:sans-serif;margin:20px}} .grid{{display:grid;grid-template-columns:1fr 1fr;gap:16px}} .card{{border:1px solid #ddd;padding:12px;border-radius:8px}}</style>
+			</head><body>
+			<h1>Pentest Report</h1>
+			<div class='grid'>
+				<div class='card'><h3>Summary</h3>
+				<ul>
+					<li>Attempts: {s.get('attempts',0)}</li>
+					<li>Successes: {s.get('successes',0)}</li>
+					<li>Failures: {s.get('failures',0)}</li>
+					<li>Lockouts: {s.get('lockouts',0)}</li>
+					<li>Errors: {s.get('errors',0)}</li>
+					<li>RPS (10s): {s.get('rps_10s',0)}</li>
+					<li>Latency p50/p95/p99 (ms): {s.get('latency_p50_ms','-')} / {s.get('latency_p95_ms','-')} / {s.get('latency_p99_ms','-')}</li>
+				</ul></div>
+				<div class='card'><h3>Status Codes</h3><table><tr><th>Code</th><th>Count</th></tr>
+				{''.join(f'<tr><td>{c}</td><td>{n}</td></tr>' for c,n in sorted((s.get('status_counts') or {}).items()))}
+				</table></div>
+			</div>
+			<div class='card' style='margin-top:16px;'>
+				<h3>Requests per second (last 60s)</h3>
+				<canvas id='rpsChart' height='120'></canvas>
+			</div>
+			<script>
+			const data = {json.dumps(buckets)};
+			const ctx = document.getElementById('rpsChart').getContext('2d');
+			new Chart(ctx, {{type:'line', data: {{labels: data.map((_,i)=>i-59), datasets:[{{label:'RPS', data, borderColor:'#2a7', tension:0.25}}]}}, options: {{plugins:{{legend:{{display:false}}}}, scales: {{x: {{display:false}}, y: {{beginAtZero:true}}}}}}}});
+			</script>
+			</body></html>
+			"""
+			with open(path, 'w', encoding='utf-8') as f:
+				f.write(html)
+			self._append_preview(f"Saved HTML report to {path}")
+		except Exception as exc:
+			messagebox.showerror("Export failed", str(exc))
 
 
 if __name__ == "__main__":
