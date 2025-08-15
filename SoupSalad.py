@@ -12,6 +12,7 @@ from collections import deque
 from datetime import datetime
 from urllib.parse import urlparse
 from urllib.parse import urlencode
+import html
 
 import tkinter as tk
 from tkinter import filedialog
@@ -188,6 +189,7 @@ class PasswordListGeneratorApp:
 		self.var_capture_failures_n = tk.IntVar(value=5)
 		self.captured_artifacts: list[dict] = []
 		self._failures_captured = 0
+		self.found_credentials: list[dict] = []
 
 		# Engine (sync vs async)
 		self.var_async_engine = tk.BooleanVar(value=False)
@@ -484,6 +486,8 @@ class PasswordListGeneratorApp:
 		tkbtn = ttk.Button(actions, text="Export CSV", command=self.on_export_report_csv)
 		tkbtn.pack(side=tk.LEFT, padx=8)
 		ttk.Button(actions, text="Export HTML", command=self.on_export_report_html).pack(side=tk.LEFT, padx=8)
+		ttk.Button(actions, text="Export PDF", command=self.on_export_pdf).pack(side=tk.LEFT, padx=8)
+		ttk.Button(actions, text="Export OSCP MD", command=self.on_export_oscp_markdown).pack(side=tk.LEFT, padx=8)
 		ttk.Button(actions, text="Export Evidence Bundle", command=self.on_export_evidence_bundle).pack(side=tk.LEFT, padx=8)
 		# Artifacts capture controls
 		ttk.Checkbutton(actions, text="Capture artifacts", variable=self.var_capture_enabled).pack(side=tk.LEFT, padx=12)
@@ -1016,6 +1020,7 @@ class PasswordListGeneratorApp:
 		# Reset artifacts
 		self.captured_artifacts = []
 		self._failures_captured = 0
+		self.found_credentials = []
 
 		# Start worker
 		self.is_running = True
@@ -2136,6 +2141,19 @@ class PasswordListGeneratorApp:
 									pass
 							if success:
 								found_msg = f"SUCCESS: {user} / {pwd}"
+								# record for reporting/exports
+								try:
+									self.found_credentials.append({
+										"timestamp": datetime.now().isoformat(timespec='seconds'),
+										"username": user,
+										"password": pwd,
+										"status": getattr(resp, 'status_code', ''),
+										"latency_ms": int(lat*1000),
+										"proxy": proxy_used or '',
+										"ua": ua_used or '',
+									})
+								except Exception:
+									pass
 								self.ui_queue.put(("log", found_msg))
 								stop_event.set()
 								break
@@ -2332,6 +2350,7 @@ class PasswordListGeneratorApp:
 			"latency_p99_ms": p99,
 			"start_time": start_time,
 			"end_time": now,
+			"credentials": list(getattr(self, 'found_credentials', [])),
 		}
 
 	def run(self) -> None:
@@ -2462,7 +2481,10 @@ class PasswordListGeneratorApp:
 				if 0 <= d < 60:
 					buckets[59 - d] += 1
 			notes_html = f"<h3>Analyst Notes</h3><pre>{html.escape(self.notes_text.get('1.0','end-1c'))}</pre>" if hasattr(self, 'notes_text') else ""
-			html = f"""
+			creds = list(getattr(self, 'found_credentials', []))
+			creds_rows = "".join(f"<tr><td>{html.escape(c.get('username',''))}</td><td>{html.escape(c.get('password',''))}</td><td>{c.get('status','')}</td><td>{c.get('latency_ms','')}</td><td>{html.escape(c.get('proxy',''))}</td><td>{html.escape(c.get('ua',''))}</td></tr>" for c in creds)
+			creds_table = f"<div class='card'><h3>Found Credentials</h3><table border='1' cellpadding='4' cellspacing='0'><tr><th>User</th><th>Pass</th><th>Status</th><th>Latency</th><th>Proxy</th><th>UA</th></tr>{creds_rows}</table></div>" if creds else ""
+			html_doc = f"""
 			<!doctype html>
 			<html><head><meta charset='utf-8'>
 			<title>Pentest Report</title>
@@ -2472,33 +2494,16 @@ class PasswordListGeneratorApp:
 			<h1>Pentest Report</h1>
 			<div class='grid'>
 				<div class='card'><h3>Summary</h3>
-				<ul>
-					<li>Attempts: {s.get('attempts',0)}</li>
-					<li>Successes: {s.get('successes',0)}</li>
-					<li>Failures: {s.get('failures',0)}</li>
-					<li>Lockouts: {s.get('lockouts',0)}</li>
-					<li>Errors: {s.get('errors',0)}</li>
-					<li>RPS (10s): {s.get('rps_10s',0)}</li>
-					<li>Latency p50/p95/p99 (ms): {s.get('latency_p50_ms','-')} / {s.get('latency_p95_ms','-')} / {s.get('latency_p99_ms','-')}</li>
-				</ul></div>
-				<div class='card'><h3>Status Codes</h3><table><tr><th>Code</th><th>Count</th></tr>
-				{''.join(f'<tr><td>{c}</td><td>{n}</td></tr>' for c,n in sorted((s.get('status_counts') or {}).items()))}
-				</table></div>
+				<pre>{json.dumps(s, indent=2)}</pre></div>
+				{notes_html}
+				{creds_table}
 			</div>
-			<div class='card' style='margin-top:16px;'>
-				<h3>Requests per second (last 60s)</h3>
-				<canvas id='rpsChart' height='120'></canvas>
-			</div>
-			<div class='card' style='margin-top:16px;'>{notes_html}</div>
-			<script>
-			const data = {json.dumps(buckets)};
-			const ctx = document.getElementById('rpsChart').getContext('2d');
-			new Chart(ctx, {{type:'line', data: {{labels: data.map((_,i)=>i-59), datasets:[{{label:'RPS', data, borderColor:'#2a7', tension:0.25}}]}}, options: {{plugins:{{legend:{{display:false}}}}, scales: {{x: {{display:false}}, y: {{beginAtZero:true}}}}}}}});
-			</script>
+			<canvas id='c' height='120'></canvas>
+			<script>const d={json.dumps(buckets)};new Chart(document.getElementById('c').getContext('2d'),{{type:'line',data:{{labels:d.map((_,i)=>i-59),datasets:[{{label:'RPS',data:d,borderColor:'#2a7',tension:0.25}}]}},options:{{plugins:{{legend:{{display:false}}}},scales:{{x:{{display:false}},y:{{beginAtZero:true}}}}}}}});</script>
 			</body></html>
 			"""
 			with open(path, 'w', encoding='utf-8') as f:
-				f.write(html)
+				f.write(html_doc)
 			self._append_preview(f"Saved HTML report to {path}")
 		except Exception as exc:
 			messagebox.showerror("Export failed", str(exc))
@@ -2788,9 +2793,15 @@ class PasswordListGeneratorApp:
 				if 0 <= d < 60:
 					buckets[59 - d] += 1
 			notes_html = f"<h3>Analyst Notes</h3><pre>{html.escape(self.notes_text.get('1.0','end-1c'))}</pre>" if hasattr(self, 'notes_text') else ""
-			html = f"<html><head><meta charset='utf-8'><script src='https://cdn.jsdelivr.net/npm/chart.js'></script></head><body><h1>Pentest Report</h1>{notes_html}<pre>{json.dumps(s, indent=2)}</pre><canvas id='c' height='120'></canvas><script>const d={json.dumps(buckets)};new Chart(document.getElementById('c').getContext('2d'),{{type:'line',data:{{labels:d.map((_,i)=>i-59),datasets:[{{label:'RPS',data:d,borderColor:'#2a7',tension:0.25}}]}},options:{{plugins:{{legend:{{display:false}}}},scales:{{x:{{display:false}},y:{{beginAtZero:true}}}}}}}});</script></body></html>"
+			creds = list(getattr(self, 'found_credentials', []))
+			creds_rows = "".join(f"<tr><td>{html.escape(c.get('username',''))}</td><td>{html.escape(c.get('password',''))}</td><td>{c.get('status','')}</td><td>{c.get('latency_ms','')}</td><td>{html.escape(c.get('proxy',''))}</td><td>{html.escape(c.get('ua',''))}</td></tr>" for c in creds)
+			creds_table = f"<div class='card'><h3>Found Credentials</h3><table border='1' cellpadding='4' cellspacing='0'><tr><th>User</th><th>Pass</th><th>Status</th><th>Latency</th><th>Proxy</th><th>UA</th></tr>{creds_rows}</table></div>" if creds else ""
+			html_doc = f"""
+			<!doctype html>
+			<html><head><meta charset='utf-8'><script src='https://cdn.jsdelivr.net/npm/chart.js'></script></head><body><h1>Pentest Report</h1>{notes_html}{creds_table}<pre>{json.dumps(s, indent=2)}</pre><canvas id='c' height='120'></canvas><script>const d={json.dumps(buckets)};new Chart(document.getElementById('c').getContext('2d'),{{type:'line',data:{{labels:d.map((_,i)=>i-59),datasets:[{{label:'RPS',data:d,borderColor:'#2a7',tension:0.25}}]}},options:{{plugins:{{legend:{{display:false}}}},scales:{{x:{{display:false}},y:{{beginAtZero:true}}}}}}}});</script></body></html>
+			"""
 			with open(path_html, 'w', encoding='utf-8') as f:
-				f.write(html)
+				f.write(html_doc)
 			# JSON
 			with open(os.path.join(dirpath, 'report.json'), 'w', encoding='utf-8') as f:
 				json.dump(s, f, indent=2)
@@ -2803,6 +2814,15 @@ class PasswordListGeneratorApp:
 				lines.append(f"{code},{cnt}")
 			with open(os.path.join(dirpath, 'report.csv'), 'w', encoding='utf-8') as f:
 				f.write("\n".join(lines))
+			# Credentials
+			if creds:
+				with open(os.path.join(dirpath, 'credentials.csv'), 'w', encoding='utf-8') as f:
+					f.write("username,password,status,latency_ms,proxy,ua,timestamp\n")
+					for c in creds:
+						f.write(f"{c.get('username','')},{c.get('password','')},{c.get('status','')},{c.get('latency_ms','')},{c.get('proxy','')},{c.get('ua','')},{c.get('timestamp','')}\n")
+				with open(os.path.join(dirpath, 'credentials.txt'), 'w', encoding='utf-8') as f:
+					for c in creds:
+						f.write(f"{c.get('username','')}:{c.get('password','')}\n")
 			# Artifacts
 			self._export_artifacts_to_dir(dirpath)
 			# HAR
@@ -2907,6 +2927,9 @@ class PasswordListGeneratorApp:
 				if 0 <= d < 60:
 					buckets[59 - d] += 1
 			notes_html = f"<h3>Analyst Notes</h3><pre>{html.escape(self.notes_text.get('1.0','end-1c'))}</pre>" if hasattr(self, 'notes_text') else ""
+			creds = list(getattr(self, 'found_credentials', []))
+			creds_rows = "".join(f"<tr><td>{html.escape(c.get('username',''))}</td><td>{html.escape(c.get('password',''))}</td><td>{c.get('status','')}</td><td>{c.get('latency_ms','')}</td><td>{html.escape(c.get('proxy',''))}</td><td>{html.escape(c.get('ua',''))}</td></tr>" for c in creds)
+			creds_table = f"<div class='card'><h3>Found Credentials</h3><table border='1' cellpadding='4' cellspacing='0'><tr><th>User</th><th>Pass</th><th>Status</th><th>Latency</th><th>Proxy</th><th>UA</th></tr>{creds_rows}</table></div>" if creds else ""
 			html_doc = f"""
 			<!doctype html><html><head><meta charset='utf-8'><title>Pentest Report</title>
 			<style>body{{font-family:sans-serif;margin:20px}} .grid{{display:grid;grid-template-columns:1fr 1fr;gap:16px}} .card{{border:1px solid #ddd;padding:12px;border-radius:8px}}</style>
@@ -3272,7 +3295,7 @@ class PasswordListGeneratorApp:
 						baseline_len = text_len
 						baseline_status = code
 					self._record_attempt(ok, code, lat)
-					self._maybe_capture_artifact(cfg, resp, username=f"INTRUDER:{combo}", password="", extra_notes="intruder")
+					self._maybe_capture_artifact(cfg, user=f"INTRUDER:{combo}", pwd="", method=(cfg.get('method') or 'POST'), url=(cfg.get('url') or ''), headers=dict(getattr(sess, 'headers', {})), params={}, resp=resp, success=ok, proxy=None, ua=None, latency_ms=lat)
 					# Post result to UI
 					try:
 						fail_re = cfg.get('failure_regex')
@@ -3363,6 +3386,60 @@ class PasswordListGeneratorApp:
 			return dict(client.cookies)
 		except Exception:
 			return {}
+
+	def on_export_oscp_markdown(self) -> None:
+		"""Export an OSCP-friendly Markdown report including metrics, credentials, evidence, and notes."""
+		s = self._report_snapshot()
+		path = filedialog.asksaveasfilename(defaultextension=".md", filetypes=[("Markdown", "*.md"), ("All files", "*.*")])
+		if not path:
+			return
+		try:
+			notes = self.notes_text.get('1.0','end-1c') if hasattr(self, 'notes_text') else ""
+			creds = list(getattr(self, 'found_credentials', []))
+			lines: list[str] = []
+			lines.append("# OSCP Credential Attempt Summary")
+			lines.append("")
+			lines.append("## Target")
+			lines.append(f"- URL: {self.var_target_url.get().strip()}")
+			lines.append(f"- Method: {self.var_http_method.get().upper()}")
+			lines.append("")
+			lines.append("## Summary")
+			for k in ["attempts","successes","failures","lockouts","errors","rps_10s","latency_p50_ms","latency_p95_ms","latency_p99_ms"]:
+				lines.append(f"- {k}: {s.get(k,'')}")
+			lines.append("")
+			if creds:
+				lines.append("## Found Credentials")
+				lines.append("")
+				lines.append("| Username | Password | Status | Latency (ms) |")
+				lines.append("|---|---:|---:|---:|")
+				for c in creds:
+					lines.append(f"| {c.get('username','')} | {c.get('password','')} | {c.get('status','')} | {c.get('latency_ms','')} |")
+				lines.append("")
+			if self.captured_artifacts:
+				lines.append("## Evidence (Requests/Responses)")
+				for i, a in enumerate(self.captured_artifacts, 1):
+					lines.append(f"### Artifact {i}")
+					lines.append("")
+					lines.append("Request:")
+					lines.append("```")
+					lines.append(a.get('raw_request',''))
+					lines.append("```")
+					lines.append("Response:")
+					lines.append("```")
+					lines.append(a.get('raw_response','')[: int(self.var_capture_max_bytes.get() or 65536)])
+					lines.append("```")
+					lines.append("")
+			if notes:
+				lines.append("## Analyst Notes")
+				lines.append("")
+				lines.append("```")
+				lines.append(notes)
+				lines.append("```")
+			with open(path, "w", encoding="utf-8") as f:
+				f.write("\n".join(lines))
+			self._append_preview(f"Saved OSCP Markdown to {path}")
+		except Exception as exc:
+			messagebox.showerror("Export failed", str(exc))
 
 
 if __name__ == "__main__":
