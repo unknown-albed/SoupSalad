@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 from urllib.parse import urlencode
 import html
 import argparse
+import xml.etree.ElementTree as ET
 
 import tkinter as tk
 from tkinter import filedialog
@@ -3720,6 +3721,177 @@ def run_recon_cli(domain: str, wordlist_path: str, out_dir: str, max_subs: int =
 			f.write(f"{r.get('url')} {r.get('status')} {r.get('len')}\n")
 	print(f"[recon] Alive: {len(alive_only)} -> {os.path.join(out_dir, 'recon_alive.txt')}\n")
 
+# -------------------- Multi-target orchestration --------------------
+
+def _parse_targets_file(path: str) -> list[str]:
+	urls: list[str] = []
+	try:
+		with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+			for line in f:
+				w = line.strip()
+				if not w or w.startswith('#'):
+					continue
+				if not w.startswith('http'):
+					w = 'http://' + w
+				urls.append(w)
+	except Exception as exc:
+		print(f"[targets] Failed to read {path}: {exc}", file=sys.stderr)
+	return urls
+
+
+def _parse_nmap_xml_targets(path: str) -> list[str]:
+	urls: list[str] = []
+	try:
+		tree = ET.parse(path)
+		root = tree.getroot()
+		for host in root.findall('host'):
+			addr = None
+			for a in host.findall('address'):
+				if a.get('addr'):
+					addr = a.get('addr')
+					break
+			if addr is None:
+				continue
+			services: list[tuple[int, str]] = []
+			ports = host.find('ports')
+			if ports is None:
+				continue
+			for p in ports.findall('port'):
+				state = (p.find('state').get('state') if p.find('state') is not None else '')
+				if state != 'open':
+					continue
+				portid = int(p.get('portid') or 0)
+				service = p.find('service')
+				name = (service.get('name') if service is not None else '') or ''
+				services.append((portid, name))
+			# Heuristics: any service containing 'https' -> https; 'http' -> http
+			for portid, name in services:
+				nm = name.lower()
+				if 'http' in nm:
+					scheme = 'https' if ('https' in nm or portid == 443) else 'http'
+					urls.append(f"{scheme}://{addr}:{portid}")
+	except Exception as exc:
+		print(f"[nmap] Failed to parse {path}: {exc}", file=sys.stderr)
+	return urls
+
+
+def _label_for_target(url: str) -> str:
+	try:
+		u = urlparse(url)
+		host = u.hostname or 'target'
+		port = u.port
+		label = host if not port else f"{host}_{port}"
+		label = re.sub(r"[^A-Za-z0-9_.-]", "_", label)
+		return label
+	except Exception:
+		return "target"
+
+
+def _replace_target_placeholders(app: 'PasswordListGeneratorApp', url: str) -> None:
+	base_host = (urlparse(url).hostname or '')
+	try:
+		# Replace TARGET in main URL
+		if 'TARGET' in app.var_target_url.get():
+			app.var_target_url.set(app.var_target_url.get().replace('TARGET', base_host))
+		# Replace in flow steps
+		for step in app.flow_steps:
+			u = step.get('url') or ''
+			if 'TARGET' in u:
+				step['url'] = u.replace('TARGET', base_host)
+	except Exception:
+		pass
+
+
+def _aggregate_md(out_path: str, sections: list[dict]) -> None:
+	try:
+		lines: list[str] = []
+		lines.append("# Multi-target Summary\n")
+		for sec in sections:
+			label = sec.get('label','target')
+			url = sec.get('url','')
+			s = sec.get('snapshot',{})
+			creds = sec.get('credentials',[])
+			lines.append(f"## {label}")
+			lines.append("")
+			lines.append(f"- URL: {url}")
+			for k in ["attempts","successes","failures","lockouts","errors","rps_10s","latency_p50_ms","latency_p95_ms","latency_p99_ms"]:
+				lines.append(f"- {k}: {s.get(k,'')}")
+			if creds:
+				lines.append("")
+				lines.append("| Username | Password | Status | Latency (ms) |")
+				lines.append("|---|---:|---:|---:|")
+				for c in creds:
+					lines.append(f"| {c.get('username','')} | {c.get('password','')} | {c.get('status','')} | {c.get('latency_ms','')} |")
+			lines.append("")
+		with open(out_path, 'w', encoding='utf-8') as f:
+			f.write("\n".join(lines))
+	except Exception as exc:
+		print(f"[aggregate] Failed MD export: {exc}", file=sys.stderr)
+
+
+def _aggregate_docx(out_path: str, sections: list[dict]) -> None:
+	try:
+		from docx import Document
+		doc = Document()
+		doc.add_heading('Multi-target Summary', 0)
+		for sec in sections:
+			label = sec.get('label','target')
+			url = sec.get('url','')
+			s = sec.get('snapshot',{})
+			creds = sec.get('credentials',[])
+			doc.add_heading(label, level=1)
+			p = doc.add_paragraph(); p.add_run('URL: ').bold = True; p.add_run(url)
+			for k in ["attempts","successes","failures","lockouts","errors","rps_10s","latency_p50_ms","latency_p95_ms","latency_p99_ms"]:
+				doc.add_paragraph(f"{k}: {s.get(k,'')}")
+			if creds:
+				tab = doc.add_table(rows=1, cols=4)
+				hdr = tab.rows[0].cells
+				hdr[0].text='Username'; hdr[1].text='Password'; hdr[2].text='Status'; hdr[3].text='Latency (ms)'
+				for c in creds:
+					row = tab.add_row().cells
+					row[0].text = str(c.get('username',''))
+					row[1].text = str(c.get('password',''))
+					row[2].text = str(c.get('status',''))
+					row[3].text = str(c.get('latency_ms',''))
+		doc.save(out_path)
+	except Exception as exc:
+		print(f"[aggregate] Failed DOCX export: {exc}", file=sys.stderr)
+
+
+def run_multi_targets_cli(profile_path: str, targets: list[str], base_out_dir: str | None, aggregate_md: str | None, aggregate_docx: str | None, no_gui: bool = True) -> None:
+	sections: list[dict] = []
+	for url in targets:
+		label = _label_for_target(url)
+		out_dir = os.path.join(base_out_dir or os.getcwd(), label)
+		os.makedirs(out_dir, exist_ok=True)
+		app = PasswordListGeneratorApp()
+		try:
+			if no_gui:
+				app.root.withdraw()
+		except Exception:
+			pass
+		app.load_profile_from_file(profile_path)
+		app.var_target_url.set(url)
+		_replace_target_placeholders(app, url)
+		app.on_generate()
+		if app.worker_thread:
+			try:
+				while app.worker_thread.is_alive():
+					app.worker_thread.join(timeout=0.5)
+			except KeyboardInterrupt:
+				app.cancel_requested = True
+				if app.worker_thread:
+					app.worker_thread.join()
+		# Export per-target bundle
+		app.export_evidence_bundle_to_dir(out_dir)
+		sec = {"label": label, "url": url, "snapshot": app._report_snapshot(), "credentials": list(getattr(app, 'found_credentials', []))}
+		sections.append(sec)
+	# Aggregate
+	if aggregate_md:
+		_aggregate_md(aggregate_md, sections)
+	if aggregate_docx:
+		_aggregate_docx(aggregate_docx, sections)
+
 
 if __name__ == "__main__":
 	parser = argparse.ArgumentParser(add_help=True)
@@ -3728,19 +3900,36 @@ if __name__ == "__main__":
 	parser.add_argument('--bundle-dir', dest='bundle_dir', help='Evidence bundle output directory (defaults to --out-dir)')
 	parser.add_argument('--report-md', dest='report_md', help='Path to write OSCP Markdown report')
 	parser.add_argument('--report-docx', dest='report_docx', help='Path to write OSCP DOCX report')
+	parser.add_argument('--aggregate-md', dest='agg_md', help='Path to write aggregated Markdown for multi-target runs')
+	parser.add_argument('--aggregate-docx', dest='agg_docx', help='Path to write aggregated DOCX for multi-target runs')
+	parser.add_argument('--targets-file', dest='targets_file', help='Text file with one host/URL per line')
+	parser.add_argument('--nmap-xml', dest='nmap_xml', help='Nmap -oX output to extract HTTP targets')
 	parser.add_argument('--recon', dest='recon_domain', help='Run subdomain recon for a domain (e.g., example.com)')
 	parser.add_argument('--wordlist', dest='wordlist', help='Wordlist for subdomains (default: wordlist.txt in repo)')
 	parser.add_argument('--max-subs', dest='max_subs', type=int, default=1000, help='Max subdomains to scan from wordlist')
 	parser.add_argument('--no-gui', dest='no_gui', action='store_true', help='Try to hide the GUI window (withdraw)')
 	args, _ = parser.parse_known_args()
 	# CLI branches
-	if args.cli_profile or args.recon_domain:
+	if args.cli_profile or args.recon_domain or args.targets_file or args.nmap_xml:
 		# Recon first if requested
 		if args.recon_domain:
 			wl = args.wordlist or os.path.join(os.path.dirname(__file__), 'wordlist.txt')
 			out_dir = args.out_dir or os.getcwd()
 			run_recon_cli(args.recon_domain, wl, out_dir, max_subs=int(args.max_subs or 1000))
-		# Profile-driven CLI
+		# Multi-target orchestration
+		if args.cli_profile and (args.targets_file or args.nmap_xml):
+			targets: list[str] = []
+			if args.targets_file:
+				targets.extend(_parse_targets_file(args.targets_file))
+			if args.nmap_xml:
+				targets.extend(_parse_nmap_xml_targets(args.nmap_xml))
+			targets = [t for t in targets if t]
+			if not targets:
+				print("[multi] No targets found", file=sys.stderr)
+				sys.exit(1)
+			run_multi_targets_cli(args.cli_profile, targets, args.out_dir or os.getcwd(), args.agg_md, args.agg_docx, no_gui=bool(args.no_gui))
+			sys.exit(0)
+		# Single profile-driven CLI
 		if args.cli_profile:
 			app = PasswordListGeneratorApp()
 			try:
