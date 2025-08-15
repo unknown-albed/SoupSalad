@@ -1,62 +1,131 @@
 # SoupSalad
 
-The Password List Generator is a Python application built using the tkinter library. It allows users to generate a list of passwords based on their profile information. The application provides an intuitive GUI where users can enter their name, surname, city, birthdate, and define the minimum and maximum characters for the passwords. Users can also specify additional special characters to include in the password generation process.
+A modernized, GUI-based Password List Generator built with Python. Generate custom password dictionaries from profile data using either character brute-force or realistic smart mutations.
 
-The application utilizes the itertools library to generate all possible combinations of characters based on the provided profile information and length range. The generated passwords are saved to a text file, allowing users to easily obtain a list of potential passwords for various purposes.
+## Highlights
 
-Key Features:
+- Modern themed UI (uses ttkbootstrap when available)
+- Three generation modes:
+  - Brute-force over a chosen character set and length range
+  - Smart brute-force (prioritized, reduced charset based on your inputs)
+  - Smart mutations from tokens (name, surname, city, birthdate, optional wordlist) with case/leet/suffix variations
+- Live progress with ETA, sample preview, logs, and a reporting panel (RPS, latency percentiles, HTTP code table)
+- Output to .txt or compressed .txt.gz
+- Optional Pentest mode (authorized testing only):
+  - HTTP GET/POST attempts with rate limiting, concurrency, and cancel
+  - Async engine (httpx) with HTTP/2, connection pooling, retries/backoff
+  - Username lists and password spraying with cooldown windows
+  - Rotating proxies (list/Tor) and User-Agent rotation (per worker/request)
+  - Auto form discovery (action/method/fields) and per-attempt CSRF refresh
+  - Pre-login GET chain (follow redirects) and optional headless JS (Playwright) to prep cookies/tokens
+  - Basic SQLi probes, lockout detection with adaptive backoff
+  - Checkpoint/resume for long spray runs
+  - Export reports to JSON/CSV/HTML (Chart.js RPS graph)
+- Save/Load profiles as JSON (legacy .pkl still loadable)
+- Safety caps and warnings to avoid unbounded generation
 
-User-friendly GUI for entering profile information and generating passwords.
-Ability to save the generated password list to a text file.
-Support for defining the minimum and maximum character lengths for the passwords.
-Option to include additional special characters in the password generation process.
-Progress bar and status updates to track the password generation progress.
-Support for saving and loading user profiles to quickly populate the input fields.
-This Password List Generator provides a convenient way to generate a customized list of potential passwords based on user-defined parameters. It can be used for various purposes, such as password testing, generating password options for multiple accounts, or creating password dictionaries for security analysis.
+## Install
 
-Feel free to customize and enhance the application further to suit your specific requirements.
+- Python 3.9+
+- Optional: ttkbootstrap for a modern theme
+- Pentest requirements:
+  - `requests` (sync engine)
+  - `httpx` (async engine with HTTP/2)
+  - `playwright` (optional, headless JS for pre-login) + browser binaries
 
-Happy coding!
+```bash
+pip install -r requirements.txt
+# Pentest extras
+pip install requests httpx
+# Optional headless browser for pre-login JS
+pip install playwright
+playwright install chromium
+```
 
-Step-by-step instructions on how to use the Password List Generator:
+If you prefer not to install ttkbootstrap, the app will fall back to standard Tkinter ttk.
 
-1. Clone the Repository:
-   - Open your command-line interface (CLI) or terminal.
-   - Navigate to the directory where you want to clone the repository.
-   - Execute the following command: `git clone https://github.com/your-username/Password-List-Generator.git`
-   - The repository will be cloned to your local machine.
+## OS-specific setup
 
-2. Install Dependencies:
-   - Ensure that you have Python installed on your machine (version 3.6 or above).
-   - Open your CLI or terminal and navigate to the cloned repository's directory.
-   - Execute the following command to install the required dependencies: `pip install -r requirements.txt`
+### Linux (Debian/Ubuntu)
 
-3. Launch the Application:
-   - In the same CLI or terminal, execute the following command: `python password_list_generator.py`
-   - The Password List Generator application window will open.
+- Ensure Tk and venv tools are present:
+```bash
+sudo apt update
+sudo apt install -y python3-tk python3-venv
+```
+- Create and activate a virtual environment, then install deps:
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install requests httpx
+# For headless JS pre-login
+pip install playwright && playwright install chromium
+```
 
-4. Enter Profile Information:
-   - In the application window, enter your profile information in the corresponding input fields.
-   - Provide your name, surname, city, birthdate, minimum and maximum characters for passwords, and optional special characters.
-   - Ensure that all mandatory fields (name, surname, city) are filled in.
+### Windows (PowerShell)
 
-5. Generate Password List:
-   - Click on the "Generate Password List" button to start generating the password list.
-   - The application will display a progress bar indicating the completion percentage.
-   - You can pause the password generation process by clicking the "Generate Password List" button again.
+- Install Python 3.9+ from python.org (make sure “Add Python to PATH” is checked)
+- Create and activate venv, then install deps:
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+pip install requests httpx
+# Optional headless JS
+pip install playwright
+playwright install chromium
+```
+- Tkinter ships with standard Python installers. If it’s missing, reinstall Python choosing the full feature set.
 
-6. Save the Password List:
-   - After the password generation is complete, a file dialog will open.
-   - Choose the directory where you want to save the generated password list.
-   - Enter a filename for the password list file.
-   - Click the "Save" button to save the password list to the selected location.
+### macOS
 
-7. Save and Load Profiles (Optional):
-   - You can save and load profiles to quickly populate the input fields.
-   - Click on the "Save Profile" button to save the current profile information to a profile file.
-   - Click on the "Load Profile" button to load a previously saved profile file.
+- Using Homebrew Python:
+```bash
+brew install python-tk@3
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install requests httpx
+# Optional headless JS
+pip install playwright && playwright install chromium
+```
+- If you use the official Python.org installer, Tkinter is included; you can skip the Homebrew tk install.
 
-8. Exit the Application:
-   - To exit the Password List Generator, simply close the application window.
+## Run
 
-That's it! You can now use the Password List Generator to generate customized password lists based on your profile information. Feel free to explore the application's features and customize it further to suit your needs.
+```bash
+python SoupSalad.py
+```
+
+## Usage (Pentest)
+
+1. Enter profile details (Name, Surname, City, Birthdate)
+2. Choose a mode (Brute-force, Smart brute-force, or Smart mutations)
+3. Pentest section:
+   - Target URL and method, username value, param names
+   - Success/failure detection (codes/regex), QPS, Concurrency
+   - Headers/Cookies/Proxy/TLS/Timeout as needed
+   - Toggle SQLi checks and choose a field
+   - Engine: sync or async (httpx), HTTP/2, limits and retry/backoff
+   - Rotation: proxies (list/Tor) and User-Agent (file or built-in) per worker/request
+   - Usernames & spraying: load username file, pattern generation, aliases, spray passwords file, cooldown settings
+   - Checkpoint: enable, select file, resume toggle
+   - Form & CSRF: auto-discover form, refresh CSRF each attempt
+   - Pre-login chain: enable, list URLs (comma), set per-attempt or per-worker, enable headless JS if needed
+4. Reporting panel shows live metrics; use Export buttons for JSON/CSV/HTML
+5. Logging: enable “Log to file” to capture attempt-level CSV (timestamp, user, pass, status, latency, success, lockout, proxy, UA)
+
+Notes:
+- Brute-force grows exponentially; prefer smart modes and spraying
+- Headless JS requires Playwright and installed browser binaries
+- Checkpoint applies to spraying; restarts resume from last password/username index
+
+## Profiles
+
+- Save profiles to JSON using "Save Profile". Load them via "Load Profile"
+- Legacy .pkl profiles from older versions can still be loaded
+
+## License
+
+MIT
