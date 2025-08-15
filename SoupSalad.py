@@ -257,6 +257,7 @@ class PasswordListGeneratorApp:
 
 		self.var_wkhtmltopdf_path = tk.StringVar(value="wkhtmltopdf")
 		self.flow_context_last: dict = {}
+		self.var_docx_template_path = tk.StringVar(value="")
 
 		# HTTP Auth
 		self.var_auth_type = tk.StringVar(value="None")  # None, Basic, Digest, NTLM
@@ -494,6 +495,15 @@ class PasswordListGeneratorApp:
 		ttk.Button(actions, text="Export Evidence Bundle", command=self.on_export_evidence_bundle).pack(side=tk.LEFT, padx=8)
 		# Artifacts capture controls
 		ttk.Checkbutton(actions, text="Capture artifacts", variable=self.var_capture_enabled).pack(side=tk.LEFT, padx=12)
+		# Template path controls
+		ttk.Label(actions, text="DOCX template").pack(side=tk.LEFT, padx=8)
+		ent_tpl = ttk.Entry(actions, textvariable=self.var_docx_template_path, width=28)
+		ent_tpl.pack(side=tk.LEFT)
+		def _browse_tpl():
+			p = filedialog.askopenfilename(filetypes=[("DOCX", "*.docx"), ("All files", "*.*")])
+			if p:
+				self.var_docx_template_path.set(p)
+		ttk.Button(actions, text="Browse…", command=_browse_tpl).pack(side=tk.LEFT, padx=4)
 		ttk.Label(actions, text="Max N").pack(side=tk.LEFT)
 		spinN = ttk.Spinbox(actions, textvariable=self.var_capture_max_artifacts, from_=1, to=200)
 		spinN.pack(side=tk.LEFT, padx=4)
@@ -3462,7 +3472,14 @@ class PasswordListGeneratorApp:
 				messagebox.showerror("Missing dependency", "Install python-docx to export DOCX: pip install python-docx")
 				return
 			s = self._report_snapshot()
-			doc = Document()
+			tpl = (self.var_docx_template_path.get() or "").strip()
+			if tpl and os.path.isfile(tpl):
+				try:
+					doc = Document(tpl)
+				except Exception:
+					doc = Document()
+			else:
+				doc = Document()
 			doc.add_heading('OSCP Credential Attempt Summary', 0)
 			p = doc.add_paragraph()
 			p.add_run('Target: ').bold = True
