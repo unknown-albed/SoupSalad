@@ -59,6 +59,8 @@ except Exception:
 	SSHAuthException = None
 	SSHGenericException = None
 
+import ftplib
+
 import asyncio
 import random
 
@@ -118,6 +120,7 @@ class PasswordListGeneratorApp:
 			"status_counts": {},  # code -> count
 			"latencies": deque(maxlen=500),
 			"attempt_timestamps": deque(maxlen=2000),
+			"error_timestamps": deque(maxlen=2000),
 			"start_time": None,
 		}
 
@@ -497,6 +500,11 @@ class PasswordListGeneratorApp:
 		ttk.Checkbutton(safe, text="Auto-pause on lockout/CAPTCHA", variable=self.var_safe_auto_pause).grid(row=0, column=7, sticky="w", padx=4, pady=4)
 		for i in range(0, 8):
 			safe.grid_columnconfigure(i, weight=1)
+		# Fail-fast controls
+		row_safe = 1
+		ttk.Checkbutton(safe, text="Fail-fast on errors", variable=self.var_failfast_enabled).grid(row=row_safe, column=0, sticky="w", padx=4, pady=2)
+		self._add_labeled_entry(safe, "Err%>", self.var_failfast_error_pct, row=row_safe, col=1)
+		self._add_labeled_entry(safe, "Window(s)", self.var_failfast_window_sec, row=row_safe, col=3)
 		# Reporting actions
 		actions = ttk.Frame(report)
 		actions.grid(row=row+1, column=0, columnspan=3, sticky="we", pady=(8,0))
@@ -725,6 +733,7 @@ class PasswordListGeneratorApp:
 			self.metrics["status_counts"] = {}
 			self.metrics["latencies"].clear()
 			self.metrics["attempt_timestamps"].clear()
+			self.metrics["error_timestamps"].clear()
 			self.metrics["start_time"] = time.time() if pentest_enabled else None
 
 	def _record_attempt(self, latency_sec: float | None, status_code: int | None, success: bool, lockout: bool, error: bool) -> None:
@@ -737,6 +746,7 @@ class PasswordListGeneratorApp:
 				self.metrics["lockouts"] += 1
 			elif error:
 				self.metrics["errors"] += 1
+				self.metrics["error_timestamps"].append(time.time())
 			else:
 				self.metrics["failures"] += 1
 			if status_code is not None:
@@ -2132,7 +2142,7 @@ class PasswordListGeneratorApp:
 							if cfg.get('proxy_rotation') == 'per_request' or cfg.get('tor_mode') or not sess.proxies:
 								purl = next_proxy_url()
 								call_proxies = build_proxies_dict(purl)
-							# Per-attempt CSRF refresh
+										# Per-attempt CSRF refresh
 							params_extra = None
 							if cfg.get('refresh_csrf'):
 								params_extra = self._fetch_csrf_sync(sess, cfg)
@@ -2146,6 +2156,9 @@ class PasswordListGeneratorApp:
 							success = self._is_success(resp, cfg)
 							error = (resp is None)
 							self._record_attempt(lat, getattr(resp, 'status_code', None), success, locked, error)
+							# Fail-fast check
+							if self._check_failfast(cfg):
+								stop_event.set(); break
 							# Attempt log
 							ua_used = None
 							try:
@@ -3983,6 +3996,8 @@ class PasswordListGeneratorApp:
 					break
 				ok, locked, error, lat = attempt(user, pwd)
 				self._record_attempt(lat/1000.0, None, ok, locked, error)
+				if self._check_failfast(cfg):
+					stop_event.set(); break
 				with lock:
 					completed += 1
 					if completed <= 50:
@@ -4036,6 +4051,26 @@ class PasswordListGeneratorApp:
 			found_msg = f"SSH run finished. Attempts: {completed:,}. No success."
 		return completed, found_msg
 
+	def _check_failfast(self, cfg: dict) -> bool:
+		if not bool(self.var_failfast_enabled.get()):
+			return False
+		try:
+			window = int(self.var_failfast_window_sec.get() or 60)
+			threshold = float(self.var_failfast_error_pct.get() or 100.0) / 100.0
+			now = time.time()
+			with self.metrics_lock:
+				ats = [t for t in self.metrics["attempt_timestamps"] if now - t <= window]
+				errs = [t for t in self.metrics["error_timestamps"] if now - t <= window]
+				attempts = len(ats)
+				errors = len(errs)
+			if attempts >= 5 and attempts > 0 and (errors / attempts) >= threshold:
+				self.cancel_requested = True
+				self.ui_queue.put(("log", f"[Fail-fast] Error rate {int((errors/attempts)*100)}% over last {window}s; stopping."))
+				return True
+		except Exception:
+			return False
+		return False
+
 
 if __name__ == "__main__":
 	parser = argparse.ArgumentParser(add_help=True)
@@ -4044,6 +4079,7 @@ if __name__ == "__main__":
 	parser.add_argument('--bundle-dir', dest='bundle_dir', help='Evidence bundle output directory (defaults to --out-dir)')
 	parser.add_argument('--report-md', dest='report_md', help='Path to write OSCP Markdown report')
 	parser.add_argument('--report-docx', dest='report_docx', help='Path to write OSCP DOCX report')
+	parser.add_argument('--docx-template', dest='docx_template', help='Path to a DOCX template (or set DOCX_TEMPLATE env)')
 	parser.add_argument('--aggregate-md', dest='agg_md', help='Path to write aggregated Markdown for multi-target runs')
 	parser.add_argument('--aggregate-docx', dest='agg_docx', help='Path to write aggregated DOCX for multi-target runs')
 	parser.add_argument('--targets-file', dest='targets_file', help='Text file with one host/URL per line')
@@ -4071,6 +4107,9 @@ if __name__ == "__main__":
 			if not targets:
 				print("[multi] No targets found", file=sys.stderr)
 				sys.exit(1)
+			# Apply docx template flag if provided
+			if args.docx_template:
+				os.environ['DOCX_TEMPLATE'] = args.docx_template
 			run_multi_targets_cli(args.cli_profile, targets, args.out_dir or os.getcwd(), args.agg_md, args.agg_docx, no_gui=bool(args.no_gui))
 			sys.exit(0)
 		# Single profile-driven CLI
@@ -4081,6 +4120,8 @@ if __name__ == "__main__":
 					app.root.withdraw()
 			except Exception:
 				pass
+			if args.docx_template:
+				app.var_docx_template_path.set(args.docx_template)
 			app.load_profile_from_file(args.cli_profile)
 			app.on_generate()
 			if app.worker_thread:
