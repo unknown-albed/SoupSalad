@@ -67,20 +67,23 @@ class RateLimiter:
 	def __init__(self, qps: float) -> None:
 		self.qps = max(0.1, float(qps))
 		self.lock = threading.Lock()
-		self.events: deque[float] = deque()
+		self._allowance = 1.0
+		self._last_check = time.monotonic()
 
 	def acquire(self) -> None:
-		# Allow at most qps events per second across all threads
+		# Token bucket to support fractional QPS with minimal CPU
 		while True:
-			now = time.time()
 			with self.lock:
-				# Drop events older than 1 second
-				while self.events and now - self.events[0] > 1.0:
-					self.events.popleft()
-				if len(self.events) < int(self.qps):
-					self.events.append(now)
+				now = time.monotonic()
+				elapsed = now - self._last_check
+				self._last_check = now
+				self._allowance = min(self.qps, self._allowance + elapsed * self.qps)
+				if self._allowance >= 1.0:
+					self._allowance -= 1.0
 					return
-			time.sleep(0.01)
+			needed = (1.0 - self._allowance) / self.qps if self.qps > 0 else 0.05
+			sleep_for = max(0.001, min(0.5, needed))
+			time.sleep(sleep_for)
 
 
 class PasswordListGeneratorApp:
@@ -1062,7 +1065,16 @@ class PasswordListGeneratorApp:
 			"output_path": self.var_output_path.get(),
 			"pentest": pentest_args,
 		}
-		self.worker_thread = threading.Thread(target=self._worker, args=(args,), daemon=True)
+		def _run_worker_safely():
+			try:
+				self._worker(args)
+			except Exception as exc:
+				try:
+					self.ui_queue.put(("log", f"Fatal worker error: {exc}"))
+					self.ui_queue.put(("done", 0, "Worker crashed; see logs"))
+				except Exception:
+					pass
+		self.worker_thread = threading.Thread(target=_run_worker_safely, daemon=True)
 		self.worker_thread.start()
 
 	def on_cancel(self) -> None:
@@ -1922,6 +1934,7 @@ class PasswordListGeneratorApp:
 		elif proto == 'FTP':
 			self.ui_queue.put(("log", "FTP spray not implemented yet"))
 			return 0, "FTP spray not implemented yet"
+		# HTTP path
 		completed = 0
 		found_msg = ""
 		start = self.start_time or time.time()
@@ -2481,7 +2494,12 @@ class PasswordListGeneratorApp:
 					buckets[59 - d] += 1
 			notes_html = f"<h3>Analyst Notes</h3><pre>{html.escape(self.notes_text.get('1.0','end-1c'))}</pre>" if hasattr(self, 'notes_text') else ""
 			creds = list(getattr(self, 'found_credentials', []))
-			creds_rows = "".join(f"<tr><td>{html.escape(c.get('username',''))}</td><td>{html.escape(c.get('password',''))}</td><td>{c.get('status','')}</td><td>{c.get('latency_ms','')}</td><td>{html.escape(c.get('proxy',''))}</td><td>{html.escape(c.get('ua',''))}</td></tr>" for c in creds)
+			def _esc(v):
+				try:
+					return html.escape(str(v))
+				except Exception:
+					return ""
+			creds_rows = "".join(f"<tr><td>{_esc(c.get('username',''))}</td><td>{_esc(c.get('password',''))}</td><td>{_esc(c.get('status',''))}</td><td>{_esc(c.get('latency_ms',''))}</td><td>{_esc(c.get('proxy',''))}</td><td>{_esc(c.get('ua',''))}</td></tr>" for c in creds)
 			creds_table = f"<div class='card'><h3>Found Credentials</h3><table border='1' cellpadding='4' cellspacing='0'><tr><th>User</th><th>Pass</th><th>Status</th><th>Latency</th><th>Proxy</th><th>UA</th></tr>{creds_rows}</table></div>" if creds else ""
 			html_doc = f"""
 			<!doctype html>
@@ -2793,7 +2811,12 @@ class PasswordListGeneratorApp:
 					buckets[59 - d] += 1
 			notes_html = f"<h3>Analyst Notes</h3><pre>{html.escape(self.notes_text.get('1.0','end-1c'))}</pre>" if hasattr(self, 'notes_text') else ""
 			creds = list(getattr(self, 'found_credentials', []))
-			creds_rows = "".join(f"<tr><td>{html.escape(c.get('username',''))}</td><td>{html.escape(c.get('password',''))}</td><td>{c.get('status','')}</td><td>{c.get('latency_ms','')}</td><td>{html.escape(c.get('proxy',''))}</td><td>{html.escape(c.get('ua',''))}</td></tr>" for c in creds)
+			def _esc(v):
+				try:
+					return html.escape(str(v))
+				except Exception:
+					return ""
+			creds_rows = "".join(f"<tr><td>{_esc(c.get('username',''))}</td><td>{_esc(c.get('password',''))}</td><td>{_esc(c.get('status',''))}</td><td>{_esc(c.get('latency_ms',''))}</td><td>{_esc(c.get('proxy',''))}</td><td>{_esc(c.get('ua',''))}</td></tr>" for c in creds)
 			creds_table = f"<div class='card'><h3>Found Credentials</h3><table border='1' cellpadding='4' cellspacing='0'><tr><th>User</th><th>Pass</th><th>Status</th><th>Latency</th><th>Proxy</th><th>UA</th></tr>{creds_rows}</table></div>" if creds else ""
 			html_doc = f"""
 			<!doctype html>
@@ -2927,7 +2950,12 @@ class PasswordListGeneratorApp:
 					buckets[59 - d] += 1
 			notes_html = f"<h3>Analyst Notes</h3><pre>{html.escape(self.notes_text.get('1.0','end-1c'))}</pre>" if hasattr(self, 'notes_text') else ""
 			creds = list(getattr(self, 'found_credentials', []))
-			creds_rows = "".join(f"<tr><td>{html.escape(c.get('username',''))}</td><td>{html.escape(c.get('password',''))}</td><td>{c.get('status','')}</td><td>{c.get('latency_ms','')}</td><td>{html.escape(c.get('proxy',''))}</td><td>{html.escape(c.get('ua',''))}</td></tr>" for c in creds)
+			def _esc(v):
+				try:
+					return html.escape(str(v))
+				except Exception:
+					return ""
+			creds_rows = "".join(f"<tr><td>{_esc(c.get('username',''))}</td><td>{_esc(c.get('password',''))}</td><td>{_esc(c.get('status',''))}</td><td>{_esc(c.get('latency_ms',''))}</td><td>{_esc(c.get('proxy',''))}</td><td>{_esc(c.get('ua',''))}</td></tr>" for c in creds)
 			creds_table = f"<div class='card'><h3>Found Credentials</h3><table border='1' cellpadding='4' cellspacing='0'><tr><th>User</th><th>Pass</th><th>Status</th><th>Latency</th><th>Proxy</th><th>UA</th></tr>{creds_rows}</table></div>" if creds else ""
 			html_doc = f"""
 			<!doctype html><html><head><meta charset='utf-8'><title>Pentest Report</title>
@@ -3525,7 +3553,12 @@ class PasswordListGeneratorApp:
 					buckets[59 - d] += 1
 			notes_html = f"<h3>Analyst Notes</h3><pre>{html.escape(self.notes_text.get('1.0','end-1c'))}</pre>" if hasattr(self, 'notes_text') else ""
 			creds = list(getattr(self, 'found_credentials', []))
-			creds_rows = "".join(f"<tr><td>{html.escape(c.get('username',''))}</td><td>{html.escape(c.get('password',''))}</td><td>{c.get('status','')}</td><td>{c.get('latency_ms','')}</td><td>{html.escape(c.get('proxy',''))}</td><td>{html.escape(c.get('ua',''))}</td></tr>" for c in creds)
+			def _esc(v):
+				try:
+					return html.escape(str(v))
+				except Exception:
+					return ""
+			creds_rows = "".join(f"<tr><td>{_esc(c.get('username',''))}</td><td>{_esc(c.get('password',''))}</td><td>{_esc(c.get('status',''))}</td><td>{_esc(c.get('latency_ms',''))}</td><td>{_esc(c.get('proxy',''))}</td><td>{_esc(c.get('ua',''))}</td></tr>" for c in creds)
 			creds_table = f"<div class='card'><h3>Found Credentials</h3><table border='1' cellpadding='4' cellspacing='0'><tr><th>User</th><th>Pass</th><th>Status</th><th>Latency</th><th>Proxy</th><th>UA</th></tr>{creds_rows}</table></div>" if creds else ""
 			html_doc = f"<html><head><meta charset='utf-8'><script src='https://cdn.jsdelivr.net/npm/chart.js'></script></head><body><h1>Pentest Report</h1>{notes_html}{creds_table}<pre>{json.dumps(s, indent=2)}</pre><canvas id='c' height='120'></canvas><script>const d={json.dumps(buckets)};new Chart(document.getElementById('c').getContext('2d'),{{type:'line',data:{{labels:d.map((_,i)=>i-59),datasets:[{{label:'RPS',data:d,borderColor:'#2a7',tension:0.25}}]}},options:{{plugins:{{legend:{{display:false}}}},scales:{{x:{{display:false}},y:{{beginAtZero:true}}}}}}}});</script></body></html>"
 			with open(path_html, 'w', encoding='utf-8') as f:
@@ -3678,223 +3711,330 @@ class PasswordListGeneratorApp:
 			pass
 		self._info("Profile loaded (CLI)")
 
-# -------------------- Recon CLI helpers --------------------
-async def _recon_scan_async(domain: str, subdomains: list[str], concurrency: int = 50, timeout: float = 5.0) -> list[dict]:
-	results: list[dict] = []
-	if httpx is None:
+	# -------------------- Recon CLI helpers --------------------
+	async def _recon_scan_async(domain: str, subdomains: list[str], concurrency: int = 50, timeout: float = 5.0) -> list[dict]:
+		results: list[dict] = []
+		if httpx is None:
+			return results
+		sem = asyncio.Semaphore(concurrency)
+		async with httpx.AsyncClient(timeout=timeout, verify=False, follow_redirects=True, http2=True) as client:
+			async def check(host: str) -> None:
+				url1 = f"http://{host}"
+				url2 = f"https://{host}"
+				for url in (url2, url1):
+					try:
+						async with sem:
+							r = await client.get(url)
+							results.append({"host": host, "url": str(r.request.url), "status": int(r.status_code), "len": len(r.text)})
+							return
+					except Exception:
+						continue
+				results.append({"host": host, "url": None, "status": None, "len": 0})
+			tasks = [asyncio.create_task(check(f"{s}.{domain}")) for s in subdomains]
+			await asyncio.gather(*tasks, return_exceptions=True)
 		return results
-	sem = asyncio.Semaphore(concurrency)
-	async with httpx.AsyncClient(timeout=timeout, verify=False, follow_redirects=True, http2=True) as client:
-		async def check(host: str) -> None:
-			url1 = f"http://{host}"
-			url2 = f"https://{host}"
-			for url in (url2, url1):
-				try:
-					async with sem:
-						r = await client.get(url)
-						results.append({"host": host, "url": str(r.request.url), "status": int(r.status_code), "len": len(r.text)})
-						return
-				except Exception:
-					continue
-			results.append({"host": host, "url": None, "status": None, "len": 0})
-		tasks = [asyncio.create_task(check(f"{s}.{domain}")) for s in subdomains]
-		await asyncio.gather(*tasks, return_exceptions=True)
-	return results
 
-def run_recon_cli(domain: str, wordlist_path: str, out_dir: str, max_subs: int = 1000) -> None:
-	try:
-		subs: list[str] = []
-		with open(wordlist_path, 'r', encoding='utf-8', errors='ignore') as f:
-			for line in f:
-				w = line.strip()
-				if w:
-					subs.append(w)
-		subs = subs[:max_subs]
-	except Exception as exc:
-		print(f"[recon] Failed to read wordlist: {exc}", file=sys.stderr)
-		return
-	print(f"[recon] Scanning {len(subs)} subdomains for {domain}...")
-	alive = asyncio.run(_recon_scan_async(domain, subs))
-	os.makedirs(out_dir, exist_ok=True)
-	alive_only = [r for r in alive if r.get('url')]
-	alive_only.sort(key=lambda x: (x.get('status') or 999, -x.get('len', 0)))
-	with open(os.path.join(out_dir, 'recon_alive.json'), 'w', encoding='utf-8') as f:
-		json.dump(alive_only, f, indent=2)
-	with open(os.path.join(out_dir, 'recon_alive.txt'), 'w', encoding='utf-8') as f:
-		for r in alive_only:
-			f.write(f"{r.get('url')} {r.get('status')} {r.get('len')}\n")
-	print(f"[recon] Alive: {len(alive_only)} -> {os.path.join(out_dir, 'recon_alive.txt')}\n")
-
-# -------------------- Multi-target orchestration --------------------
-
-def _parse_targets_file(path: str) -> list[str]:
-	urls: list[str] = []
-	try:
-		with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-			for line in f:
-				w = line.strip()
-				if not w or w.startswith('#'):
-					continue
-				if not w.startswith('http'):
-					w = 'http://' + w
-				urls.append(w)
-	except Exception as exc:
-		print(f"[targets] Failed to read {path}: {exc}", file=sys.stderr)
-	return urls
-
-
-def _parse_nmap_xml_targets(path: str) -> list[str]:
-	urls: list[str] = []
-	try:
-		tree = ET.parse(path)
-		root = tree.getroot()
-		for host in root.findall('host'):
-			addr = None
-			for a in host.findall('address'):
-				if a.get('addr'):
-					addr = a.get('addr')
-					break
-			if addr is None:
-				continue
-			services: list[tuple[int, str]] = []
-			ports = host.find('ports')
-			if ports is None:
-				continue
-			for p in ports.findall('port'):
-				state = (p.find('state').get('state') if p.find('state') is not None else '')
-				if state != 'open':
-					continue
-				portid = int(p.get('portid') or 0)
-				service = p.find('service')
-				name = (service.get('name') if service is not None else '') or ''
-				services.append((portid, name))
-			# Heuristics: any service containing 'https' -> https; 'http' -> http
-			for portid, name in services:
-				nm = name.lower()
-				if 'http' in nm:
-					scheme = 'https' if ('https' in nm or portid == 443) else 'http'
-					urls.append(f"{scheme}://{addr}:{portid}")
-	except Exception as exc:
-		print(f"[nmap] Failed to parse {path}: {exc}", file=sys.stderr)
-	return urls
-
-
-def _label_for_target(url: str) -> str:
-	try:
-		u = urlparse(url)
-		host = u.hostname or 'target'
-		port = u.port
-		label = host if not port else f"{host}_{port}"
-		label = re.sub(r"[^A-Za-z0-9_.-]", "_", label)
-		return label
-	except Exception:
-		return "target"
-
-
-def _replace_target_placeholders(app: 'PasswordListGeneratorApp', url: str) -> None:
-	base_host = (urlparse(url).hostname or '')
-	try:
-		# Replace TARGET in main URL
-		if 'TARGET' in app.var_target_url.get():
-			app.var_target_url.set(app.var_target_url.get().replace('TARGET', base_host))
-		# Replace in flow steps
-		for step in app.flow_steps:
-			u = step.get('url') or ''
-			if 'TARGET' in u:
-				step['url'] = u.replace('TARGET', base_host)
-	except Exception:
-		pass
-
-
-def _aggregate_md(out_path: str, sections: list[dict]) -> None:
-	try:
-		lines: list[str] = []
-		lines.append("# Multi-target Summary\n")
-		for sec in sections:
-			label = sec.get('label','target')
-			url = sec.get('url','')
-			s = sec.get('snapshot',{})
-			creds = sec.get('credentials',[])
-			lines.append(f"## {label}")
-			lines.append("")
-			lines.append(f"- URL: {url}")
-			for k in ["attempts","successes","failures","lockouts","errors","rps_10s","latency_p50_ms","latency_p95_ms","latency_p99_ms"]:
-				lines.append(f"- {k}: {s.get(k,'')}")
-			if creds:
-				lines.append("")
-				lines.append("| Username | Password | Status | Latency (ms) |")
-				lines.append("|---|---:|---:|---:|")
-				for c in creds:
-					lines.append(f"| {c.get('username','')} | {c.get('password','')} | {c.get('status','')} | {c.get('latency_ms','')} |")
-			lines.append("")
-		with open(out_path, 'w', encoding='utf-8') as f:
-			f.write("\n".join(lines))
-	except Exception as exc:
-		print(f"[aggregate] Failed MD export: {exc}", file=sys.stderr)
-
-
-def _aggregate_docx(out_path: str, sections: list[dict]) -> None:
-	try:
-		from docx import Document
-		doc = Document()
-		doc.add_heading('Multi-target Summary', 0)
-		for sec in sections:
-			label = sec.get('label','target')
-			url = sec.get('url','')
-			s = sec.get('snapshot',{})
-			creds = sec.get('credentials',[])
-			doc.add_heading(label, level=1)
-			p = doc.add_paragraph(); p.add_run('URL: ').bold = True; p.add_run(url)
-			for k in ["attempts","successes","failures","lockouts","errors","rps_10s","latency_p50_ms","latency_p95_ms","latency_p99_ms"]:
-				doc.add_paragraph(f"{k}: {s.get(k,'')}")
-			if creds:
-				tab = doc.add_table(rows=1, cols=4)
-				hdr = tab.rows[0].cells
-				hdr[0].text='Username'; hdr[1].text='Password'; hdr[2].text='Status'; hdr[3].text='Latency (ms)'
-				for c in creds:
-					row = tab.add_row().cells
-					row[0].text = str(c.get('username',''))
-					row[1].text = str(c.get('password',''))
-					row[2].text = str(c.get('status',''))
-					row[3].text = str(c.get('latency_ms',''))
-		doc.save(out_path)
-	except Exception as exc:
-		print(f"[aggregate] Failed DOCX export: {exc}", file=sys.stderr)
-
-
-def run_multi_targets_cli(profile_path: str, targets: list[str], base_out_dir: str | None, aggregate_md: str | None, aggregate_docx: str | None, no_gui: bool = True) -> None:
-	sections: list[dict] = []
-	for url in targets:
-		label = _label_for_target(url)
-		out_dir = os.path.join(base_out_dir or os.getcwd(), label)
-		os.makedirs(out_dir, exist_ok=True)
-		app = PasswordListGeneratorApp()
+	def run_recon_cli(domain: str, wordlist_path: str, out_dir: str, max_subs: int = 1000) -> None:
 		try:
-			if no_gui:
-				app.root.withdraw()
+			subs: list[str] = []
+			with open(wordlist_path, 'r', encoding='utf-8', errors='ignore') as f:
+				for line in f:
+					w = line.strip()
+					if w:
+						subs.append(w)
+			subs = subs[:max_subs]
+		except Exception as exc:
+			print(f"[recon] Failed to read wordlist: {exc}", file=sys.stderr)
+			return
+		print(f"[recon] Scanning {len(subs)} subdomains for {domain}...")
+		alive = asyncio.run(_recon_scan_async(domain, subs))
+		os.makedirs(out_dir, exist_ok=True)
+		alive_only = [r for r in alive if r.get('url')]
+		alive_only.sort(key=lambda x: (x.get('status') or 999, -x.get('len', 0)))
+		with open(os.path.join(out_dir, 'recon_alive.json'), 'w', encoding='utf-8') as f:
+			json.dump(alive_only, f, indent=2)
+		with open(os.path.join(out_dir, 'recon_alive.txt'), 'w', encoding='utf-8') as f:
+			for r in alive_only:
+				f.write(f"{r.get('url')} {r.get('status')} {r.get('len')}\n")
+		print(f"[recon] Alive: {len(alive_only)} -> {os.path.join(out_dir, 'recon_alive.txt')}\n")
+
+	# -------------------- Multi-target orchestration --------------------
+
+	def _parse_targets_file(path: str) -> list[str]:
+		urls: list[str] = []
+		try:
+			with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+				for line in f:
+					w = line.strip()
+					if not w or w.startswith('#'):
+						continue
+					if not w.startswith('http'):
+						w = 'http://' + w
+					urls.append(w)
+		except Exception as exc:
+			print(f"[targets] Failed to read {path}: {exc}", file=sys.stderr)
+		return urls
+
+
+	def _parse_nmap_xml_targets(path: str) -> list[str]:
+		urls: list[str] = []
+		try:
+			tree = ET.parse(path)
+			root = tree.getroot()
+			for host in root.findall('host'):
+				addr = None
+				for a in host.findall('address'):
+					if a.get('addr'):
+						addr = a.get('addr')
+						break
+				if addr is None:
+					continue
+				services: list[tuple[int, str]] = []
+				ports = host.find('ports')
+				if ports is None:
+					continue
+				for p in ports.findall('port'):
+					state = (p.find('state').get('state') if p.find('state') is not None else '')
+					if state != 'open':
+						continue
+					portid = int(p.get('portid') or 0)
+					service = p.find('service')
+					name = (service.get('name') if service is not None else '') or ''
+					services.append((portid, name))
+				# Heuristics: any service containing 'https' -> https; 'http' -> http
+				for portid, name in services:
+					nm = name.lower()
+					if 'http' in nm:
+						scheme = 'https' if ('https' in nm or portid == 443) else 'http'
+						urls.append(f"{scheme}://{addr}:{portid}")
+		except Exception as exc:
+			print(f"[nmap] Failed to parse {path}: {exc}", file=sys.stderr)
+		return urls
+
+
+	def _label_for_target(url: str) -> str:
+		try:
+			u = urlparse(url)
+			host = u.hostname or 'target'
+			port = u.port
+			label = host if not port else f"{host}_{port}"
+			label = re.sub(r"[^A-Za-z0-9_.-]", "_", label)
+			return label
+		except Exception:
+			return "target"
+
+
+	def _replace_target_placeholders(app: 'PasswordListGeneratorApp', url: str) -> None:
+		base_host = (urlparse(url).hostname or '')
+		try:
+			# Replace TARGET in main URL
+			if 'TARGET' in app.var_target_url.get():
+				app.var_target_url.set(app.var_target_url.get().replace('TARGET', base_host))
+			# Replace in flow steps
+			for step in app.flow_steps:
+				u = step.get('url') or ''
+				if 'TARGET' in u:
+					step['url'] = u.replace('TARGET', base_host)
 		except Exception:
 			pass
-		app.load_profile_from_file(profile_path)
-		app.var_target_url.set(url)
-		_replace_target_placeholders(app, url)
-		app.on_generate()
-		if app.worker_thread:
+
+
+	def _aggregate_md(out_path: str, sections: list[dict]) -> None:
+		try:
+			lines: list[str] = []
+			lines.append("# Multi-target Summary\n")
+			for sec in sections:
+				label = sec.get('label','target')
+				url = sec.get('url','')
+				s = sec.get('snapshot',{})
+				creds = sec.get('credentials',[])
+				lines.append(f"## {label}")
+				lines.append("")
+				lines.append(f"- URL: {url}")
+				for k in ["attempts","successes","failures","lockouts","errors","rps_10s","latency_p50_ms","latency_p95_ms","latency_p99_ms"]:
+					lines.append(f"- {k}: {s.get(k,'')}")
+				if creds:
+					lines.append("")
+					lines.append("| Username | Password | Status | Latency (ms) |")
+					lines.append("|---|---:|---:|---:|")
+					for c in creds:
+						lines.append(f"| {c.get('username','')} | {c.get('password','')} | {c.get('status','')} | {c.get('latency_ms','')} |")
+					lines.append("")
+			with open(out_path, 'w', encoding='utf-8') as f:
+				f.write("\n".join(lines))
+		except Exception as exc:
+			print(f"[aggregate] Failed MD export: {exc}", file=sys.stderr)
+
+
+	def _aggregate_docx(out_path: str, sections: list[dict]) -> None:
+		try:
+			from docx import Document
+			doc = Document()
+			doc.add_heading('Multi-target Summary', 0)
+			for sec in sections:
+				label = sec.get('label','target')
+				url = sec.get('url','')
+				s = sec.get('snapshot',{})
+				creds = sec.get('credentials',[])
+				doc.add_heading(label, level=1)
+				p = doc.add_paragraph(); p.add_run('URL: ').bold = True; p.add_run(url)
+				for k in ["attempts","successes","failures","lockouts","errors","rps_10s","latency_p50_ms","latency_p95_ms","latency_p99_ms"]:
+					doc.add_paragraph(f"{k}: {s.get(k,'')}")
+				if creds:
+					tab = doc.add_table(rows=1, cols=4)
+					hdr = tab.rows[0].cells
+					hdr[0].text='Username'; hdr[1].text='Password'; hdr[2].text='Status'; hdr[3].text='Latency (ms)'
+					for c in creds:
+						row = tab.add_row().cells
+						row[0].text = str(c.get('username',''))
+						row[1].text = str(c.get('password',''))
+						row[2].text = str(c.get('status',''))
+						row[3].text = str(c.get('latency_ms',''))
+			doc.save(out_path)
+		except Exception as exc:
+			print(f"[aggregate] Failed DOCX export: {exc}", file=sys.stderr)
+
+
+	def run_multi_targets_cli(profile_path: str, targets: list[str], base_out_dir: str | None, aggregate_md: str | None, aggregate_docx: str | None, no_gui: bool = True) -> None:
+		sections: list[dict] = []
+		for url in targets:
+			label = _label_for_target(url)
+			out_dir = os.path.join(base_out_dir or os.getcwd(), label)
+			os.makedirs(out_dir, exist_ok=True)
+			app = PasswordListGeneratorApp()
 			try:
-				while app.worker_thread.is_alive():
-					app.worker_thread.join(timeout=0.5)
-			except KeyboardInterrupt:
-				app.cancel_requested = True
-				if app.worker_thread:
-					app.worker_thread.join()
-		# Export per-target bundle
-		app.export_evidence_bundle_to_dir(out_dir)
-		sec = {"label": label, "url": url, "snapshot": app._report_snapshot(), "credentials": list(getattr(app, 'found_credentials', []))}
-		sections.append(sec)
-	# Aggregate
-	if aggregate_md:
-		_aggregate_md(aggregate_md, sections)
-	if aggregate_docx:
-		_aggregate_docx(aggregate_docx, sections)
+				if no_gui:
+					app.root.withdraw()
+			except Exception:
+				pass
+			app.load_profile_from_file(profile_path)
+			app.var_target_url.set(url)
+			_replace_target_placeholders(app, url)
+			app.on_generate()
+			if app.worker_thread:
+				try:
+					while app.worker_thread.is_alive():
+						app.worker_thread.join(timeout=0.5)
+				except KeyboardInterrupt:
+					app.cancel_requested = True
+					if app.worker_thread:
+						app.worker_thread.join()
+			# Export per-target bundle
+			app.export_evidence_bundle_to_dir(out_dir)
+			sec = {"label": label, "url": url, "snapshot": app._report_snapshot(), "credentials": list(getattr(app, 'found_credentials', []))}
+			sections.append(sec)
+		# Aggregate
+		if aggregate_md:
+			_aggregate_md(aggregate_md, sections)
+		if aggregate_docx:
+			_aggregate_docx(aggregate_docx, sections)
+
+	def _worker_pentest_ssh(self, mode: str, min_len: int, max_len: int, cfg: dict) -> tuple[int, str]:
+		if paramiko is None:
+			return 0, "Missing dependency: install paramiko for SSH spray"
+		completed = 0
+		found_msg = ""
+		limiter = RateLimiter(cfg.get('qps') or 1.0)
+		host = cfg.get('ssh_host') or (urlparse(cfg.get('url') or '').hostname or '')
+		port = int(cfg.get('ssh_port') or 22)
+		stop_event = threading.Event()
+		q = queue.Queue(maxsize=2000)
+		lock = threading.Lock()
+		def producer(it):
+			try:
+				for pair in it:
+					if self.cancel_requested or stop_event.is_set():
+						break
+					try:
+						q.put(pair, timeout=0.5)
+					except queue.Full:
+						continue
+			except Exception as exc:
+				self.ui_queue.put(("log", f"SSH producer error: {exc}"))
+			finally:
+				for _ in range(int(cfg.get('concurrency') or 2)):
+					try:
+						q.put_nowait((None, None))
+					except Exception:
+						pass
+		def attempt(user: str, pwd: str) -> tuple[bool, bool, bool, int]:
+			t0 = time.time()
+			try:
+				client = paramiko.SSHClient()
+				client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+				limiter.acquire()
+				client.connect(hostname=host, port=port, username=user, password=pwd, timeout=cfg.get('timeout') or 10.0, allow_agent=False, look_for_keys=False)
+				client.close()
+				lat = int((time.time() - t0) * 1000)
+				return True, False, False, lat
+			except Exception as exc:
+				lat = int((time.time() - t0) * 1000)
+				if SSHAuthException is not None and isinstance(exc, SSHAuthException):
+					return False, False, False, lat
+				return False, False, True, lat
+		def worker(wid: int):
+			nonlocal completed, found_msg
+			while not self.cancel_requested and not stop_event.is_set():
+				try:
+					user, pwd = q.get(timeout=0.5)
+				except queue.Empty:
+					continue
+				if user is None:
+					break
+				ok, locked, error, lat = attempt(user, pwd)
+				self._record_attempt(lat/1000.0, None, ok, locked, error)
+				with lock:
+					completed += 1
+					if completed <= 50:
+						self.ui_queue.put(("sample", f"TRY {user} : {pwd}"))
+				if ok:
+					found_msg = f"SUCCESS (SSH {host}:{port}): {user} / {pwd}"
+					try:
+						self.found_credentials.append({
+							"timestamp": datetime.now().isoformat(timespec='seconds'),
+							"protocol": "SSH",
+							"host": host,
+							"port": port,
+							"username": user,
+							"password": pwd,
+							"status": "",
+							"latency_ms": lat,
+						})
+					except Exception:
+						pass
+					self.ui_queue.put(("log", found_msg))
+					stop_event.set()
+					break
+		threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(int(cfg.get('concurrency') or 2))]
+		# Build iterable of pairs
+		if cfg.get('spray_enabled'):
+			pairs = ((u, p) for u in (cfg.get('usernames') or []) for p in (cfg.get('spray_passwords') or []))
+		else:
+			fixed_users = cfg.get('usernames', []) or [cfg.get('username')]
+			if mode == 'Brute-force':
+				pw_iter = self._bruteforce_stream(min_len, max_len)
+			elif mode == 'Smart brute-force':
+				pw_iter = self._smart_bruteforce_candidates(min_len, max_len)
+			else:
+				pw_iter = self._smart_candidates(min_len, max_len)
+			pairs = ((fixed_users[0], pw) for pw in pw_iter)
+		prod = threading.Thread(target=producer, args=(pairs,), daemon=True)
+		prod.start()
+		for t in threads:
+			t.start()
+		try:
+			q.join()
+		except Exception:
+			pass
+		stop_event.set()
+		for t in threads:
+			try:
+				t.join(timeout=1.0)
+			except Exception:
+				pass
+		if not found_msg:
+			found_msg = f"SSH run finished. Attempts: {completed:,}. No success."
+		return completed, found_msg
 
 
 if __name__ == "__main__":
