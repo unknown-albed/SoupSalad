@@ -51,6 +51,14 @@ try:
 except Exception:
 	requests_ntlm = None
 
+try:
+	import paramiko
+	from paramiko.ssh_exception import AuthenticationException as SSHAuthException, SSHException as SSHGenericException
+except Exception:
+	paramiko = None
+	SSHAuthException = None
+	SSHGenericException = None
+
 import asyncio
 import random
 
@@ -130,6 +138,7 @@ class PasswordListGeneratorApp:
 		# Variables - pentest target
 		self.var_target_enabled = tk.BooleanVar(value=False)
 		self.var_target_url = tk.StringVar(value="")
+		self.var_protocol = tk.StringVar(value="HTTP")  # HTTP | SSH | FTP
 		self.var_http_method = tk.StringVar(value="POST")
 		self.var_username_value = tk.StringVar(value="")
 		self.var_user_param = tk.StringVar(value="username")
@@ -319,6 +328,9 @@ class PasswordListGeneratorApp:
 		self._add_labeled_entry(target, "URL", self.var_target_url, row=1, col=0)
 		ttk.Label(target, text="Method").grid(row=1, column=2, sticky="e", padx=4, pady=4)
 		ttk.Combobox(target, textvariable=self.var_http_method, values=["POST", "GET"], width=8, state="readonly").grid(row=1, column=3, sticky="w", padx=4, pady=4)
+		# Protocol selector (for speed we place it on the same row)
+		ttk.Label(target, text="Protocol").grid(row=1, column=4, sticky="e", padx=4, pady=4)
+		ttk.Combobox(target, textvariable=self.var_protocol, values=["HTTP","SSH","FTP"], width=8, state="readonly").grid(row=1, column=5, sticky="w", padx=4, pady=4)
 		self._add_labeled_entry(target, "Username value", self.var_username_value, row=2, col=0)
 		self._add_labeled_entry(target, "Username param", self.var_user_param, row=2, col=2)
 		self._add_labeled_entry(target, "Password param", self.var_pass_param, row=2, col=4)
@@ -915,6 +927,7 @@ class PasswordListGeneratorApp:
 			pentest_args = {
 				"enabled": True,
 				"url": url,
+				"protocol": (self.var_protocol.get() or "HTTP").upper(),
 				"method": self.var_http_method.get().upper(),
 				"username": username,
 				"user_param": user_param,
@@ -1089,6 +1102,7 @@ class PasswordListGeneratorApp:
 			# Pentest
 			"target_enabled": self.var_target_enabled.get(),
 			"target_url": self.var_target_url.get(),
+			"protocol": self.var_protocol.get(),
 			"http_method": self.var_http_method.get(),
 			"username_value": self.var_username_value.get(),
 			"user_param": self.var_user_param.get(),
@@ -1220,6 +1234,7 @@ class PasswordListGeneratorApp:
 
 		self.var_target_enabled.set(bool(profile.get("target_enabled", False)))
 		self.var_target_url.set(profile.get("target_url", ""))
+		self.var_protocol.set(profile.get("protocol", "HTTP"))
 		self.var_http_method.set(profile.get("http_method", "POST"))
 		self.var_username_value.set(profile.get("username_value", ""))
 		self.var_user_param.set(profile.get("user_param", "username"))
@@ -1900,6 +1915,13 @@ class PasswordListGeneratorApp:
 		]
 
 	def _worker_pentest(self, mode: str, min_len: int, max_len: int, cfg: dict) -> tuple[int, str]:
+		# Protocol switch
+		proto = (cfg.get('protocol') or 'HTTP').upper()
+		if proto == 'SSH':
+			return self._worker_pentest_ssh(mode, min_len, max_len, cfg)
+		elif proto == 'FTP':
+			self.ui_queue.put(("log", "FTP spray not implemented yet"))
+			return 0, "FTP spray not implemented yet"
 		completed = 0
 		found_msg = ""
 		start = self.start_time or time.time()
@@ -2328,43 +2350,7 @@ class PasswordListGeneratorApp:
 		except Exception as exc:
 			messagebox.showerror("Export failed", str(exc))
 
-	def _report_snapshot(self) -> dict:
-		with self.metrics_lock:
-			attempts = self.metrics["attempts"]
-			successes = self.metrics["successes"]
-			failures = self.metrics["failures"]
-			lockouts = self.metrics["lockouts"]
-			errors = self.metrics["errors"]
-			status_counts = dict(self.metrics["status_counts"])  # copy
-			latencies = list(self.metrics["latencies"])  # copy
-			ts = list(self.metrics["attempt_timestamps"])  # copy
-		start_time = self.metrics["start_time"]
-		now = time.time()
-		recent = [t for t in ts if now - t <= 10.0]
-		rps = len(recent) / 10.0 if recent else 0.0
-		if latencies:
-			ms = sorted([x * 1000.0 for x in latencies])
-			def pctv(p):
-				idx = max(0, min(len(ms) - 1, int(round(p * (len(ms) - 1)))))
-				return int(ms[idx])
-			p50 = pctv(0.50); p95 = pctv(0.95); p99 = pctv(0.99)
-		else:
-			p50 = p95 = p99 = None
-		return {
-			"attempts": attempts,
-			"successes": successes,
-			"failures": failures,
-			"lockouts": lockouts,
-			"errors": errors,
-			"status_counts": status_counts,
-			"rps_10s": round(rps, 2),
-			"latency_p50_ms": p50,
-			"latency_p95_ms": p95,
-			"latency_p99_ms": p99,
-			"start_time": start_time,
-			"end_time": now,
-			"credentials": list(getattr(self, 'found_credentials', [])),
-		}
+	_report_snapshot = _report_snapshot
 
 	def run(self) -> None:
 		try:
@@ -3599,6 +3585,7 @@ class PasswordListGeneratorApp:
 		self.var_gzip.set(bool(profile.get("gzip", False)))
 		self.var_target_enabled.set(bool(profile.get("target_enabled", False)))
 		self.var_target_url.set(profile.get("target_url", ""))
+		self.var_protocol.set(profile.get("protocol", "HTTP"))
 		self.var_http_method.set(profile.get("http_method", "POST"))
 		self.var_username_value.set(profile.get("username_value", ""))
 		self.var_user_param.set(profile.get("user_param", "username"))
