@@ -293,6 +293,14 @@ class PasswordListGeneratorApp:
 		self.intr_results: list[dict] = []
 		self.intr_baseline: dict | None = None
 
+		self.var_failfast_enabled = tk.BooleanVar(value=False)
+		self.var_failfast_error_pct = tk.DoubleVar(value=90.0)
+		self.var_failfast_window_sec = tk.IntVar(value=60)
+		self.var_failfast_action = tk.StringVar(value="stop")  # stop | backoff
+		self.var_failfast_backoff_sec = tk.IntVar(value=30)
+		self._error_backoff_until = [0.0]
+		self._error_backoff_lock = threading.Lock()
+
 	def _default_output_path(self) -> str:
 		timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 		base = f"Passwordlist-{timestamp}.txt"
@@ -505,6 +513,9 @@ class PasswordListGeneratorApp:
 		ttk.Checkbutton(safe, text="Fail-fast on errors", variable=self.var_failfast_enabled).grid(row=row_safe, column=0, sticky="w", padx=4, pady=2)
 		self._add_labeled_entry(safe, "Err%>", self.var_failfast_error_pct, row=row_safe, col=1)
 		self._add_labeled_entry(safe, "Window(s)", self.var_failfast_window_sec, row=row_safe, col=3)
+		ttk.Label(safe, text="Action").grid(row=row_safe, column=5, sticky="e", padx=4, pady=2)
+		ttk.Combobox(safe, textvariable=self.var_failfast_action, values=["stop","backoff"], width=10, state="readonly").grid(row=row_safe, column=6, sticky="w", padx=4, pady=2)
+		self._add_labeled_entry(safe, "Backoff(s)", self.var_failfast_backoff_sec, row=row_safe, col=7)
 		# Reporting actions
 		actions = ttk.Frame(report)
 		actions.grid(row=row+1, column=0, columnspan=3, sticky="we", pady=(8,0))
@@ -2131,6 +2142,7 @@ class PasswordListGeneratorApp:
 							if self.cancel_requested or stop_event.is_set():
 								break
 							limiter.acquire()
+							self._wait_global_backoff()
 							# Per-request overrides
 							call_headers = None
 							call_proxies = None
@@ -3976,6 +3988,7 @@ class PasswordListGeneratorApp:
 				client = paramiko.SSHClient()
 				client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 				limiter.acquire()
+				self._wait_global_backoff()
 				client.connect(hostname=host, port=port, username=user, password=pwd, timeout=cfg.get('timeout') or 10.0, allow_agent=False, look_for_keys=False)
 				client.close()
 				lat = int((time.time() - t0) * 1000)
@@ -4064,12 +4077,39 @@ class PasswordListGeneratorApp:
 				attempts = len(ats)
 				errors = len(errs)
 			if attempts >= 5 and attempts > 0 and (errors / attempts) >= threshold:
-				self.cancel_requested = True
-				self.ui_queue.put(("log", f"[Fail-fast] Error rate {int((errors/attempts)*100)}% over last {window}s; stopping."))
-				return True
+				action = (self.var_failfast_action.get() or 'stop').lower()
+				pct = int((errors/attempts)*100)
+				if action == 'backoff':
+					sec = int(self.var_failfast_backoff_sec.get() or 30)
+					self._trigger_error_backoff(sec)
+					self.ui_queue.put(("log", f"[Fail-fast] Error rate {pct}% over last {window}s; backing off for ~{sec}s"))
+					return False
+				else:
+					self.cancel_requested = True
+					self.ui_queue.put(("log", f"[Fail-fast] Error rate {pct}% over last {window}s; stopping."))
+					return True
 		except Exception:
 			return False
 		return False
+
+	def _trigger_error_backoff(self, seconds: int) -> None:
+		try:
+			with self._error_backoff_lock:
+				self._error_backoff_until[0] = max(self._error_backoff_until[0], time.time() + max(1, int(seconds)))
+		except Exception:
+			pass
+
+	def _wait_global_backoff(self) -> None:
+		try:
+			while not self.cancel_requested:
+				with self._error_backoff_lock:
+					t = self._error_backoff_until[0]
+				now = time.time()
+				if now >= t:
+					return
+				time.sleep(0.2)
+		except Exception:
+			return
 
 
 if __name__ == "__main__":
