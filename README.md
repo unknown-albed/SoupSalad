@@ -13,6 +13,7 @@ A modernized, GUI-based Password List Generator built with Python. Generate cust
 - Output to .txt or compressed .txt.gz
 - Optional Pentest mode (authorized testing only):
   - HTTP GET/POST attempts with rate limiting, concurrency, and cancel
+  - SSH spray (paramiko), FTP/FTPS spray (ftplib/FTP_TLS) with safe caps
   - Async engine (httpx) with HTTP/2, connection pooling, retries/backoff
   - Username lists and password spraying with cooldown windows
   - Rotating proxies (list/Tor) and User-Agent rotation (per worker/request)
@@ -20,9 +21,11 @@ A modernized, GUI-based Password List Generator built with Python. Generate cust
   - Pre-login GET chain (follow redirects) and optional headless JS (Playwright) to prep cookies/tokens
   - Basic SQLi probes, lockout detection with adaptive backoff
   - Checkpoint/resume for long spray runs
-  - Export reports to JSON/CSV/HTML (Chart.js RPS graph)
+  - Fail-fast guard (stop or global backoff) on high error-rate in a time window
+  - Export reports to JSON/CSV/HTML (Chart.js RPS graph) and OSCP Markdown/DOCX
 - Save/Load profiles as JSON (legacy .pkl still loadable)
 - Safety caps and warnings to avoid unbounded generation
+- CLI automation: multi-target runs (targets file), Nmap XML import (HTTP), recon helper
 
 ## Install
 
@@ -31,12 +34,14 @@ A modernized, GUI-based Password List Generator built with Python. Generate cust
 - Pentest requirements:
   - `requests` (sync engine)
   - `httpx` (async engine with HTTP/2)
+  - `paramiko` (SSH)
+  - `python-docx` (DOCX export)
   - `playwright` (optional, headless JS for pre-login) + browser binaries
 
 ```bash
 pip install -r requirements.txt
 # Pentest extras
-pip install requests httpx
+pip install requests httpx paramiko python-docx
 # Optional headless browser for pre-login JS
 pip install playwright
 playwright install chromium
@@ -98,33 +103,83 @@ pip install playwright && playwright install chromium
 python SoupSalad.py
 ```
 
+## CLI automation
+
+- Multi-target from a file (HTTP/SSH/FTP depending on profile `protocol`):
+```bash
+python SoupSalad.py \
+  --profile myprofile.json \
+  --targets-file targets.txt \
+  --out-dir ./out \
+  --aggregate-md ./out/all.md \
+  --aggregate-docx ./out/all.docx \
+  --no-gui
+```
+
+- Nmap XML import (HTTP/HTTPS extraction):
+```bash
+python SoupSalad.py \
+  --profile http_profile.json \
+  --nmap-xml scan.xml \
+  --out-dir ./out \
+  --aggregate-md ./out/all.md \
+  --no-gui
+```
+
+- Single target (headless) with OSCP outputs and DOCX template:
+```bash
+python SoupSalad.py \
+  --profile profiles/oscp-safe-flow.json \
+  --out-dir ./bundle \
+  --report-md ./bundle/report.md \
+  --report-docx ./bundle/report.docx \
+  --docx-template ./template.docx \
+  --no-gui
+```
+
+Environment alternative for template: set `DOCX_TEMPLATE` or `SOUPSALAD_DOCX_TEMPLATE`.
+
 ## Usage (Pentest)
 
 1. Enter profile details (Name, Surname, City, Birthdate)
 2. Choose a mode (Brute-force, Smart brute-force, or Smart mutations)
 3. Pentest section:
-   - Target URL and method, username value, param names
-   - Success/failure detection (codes/regex), QPS, Concurrency
+   - Protocol: HTTP, SSH, FTP/FTPS
+   - Target URL and method (HTTP) or host/port (SSH/FTP), username value, param names (HTTP)
+   - Success/failure detection (HTTP codes/regex or protocol return codes), QPS, Concurrency
    - Headers/Cookies/Proxy/TLS/Timeout as needed
    - Toggle SQLi checks and choose a field
    - Engine: sync or async (httpx), HTTP/2, limits and retry/backoff
    - Rotation: proxies (list/Tor) and User-Agent (file or built-in) per worker/request
    - Usernames & spraying: load username file, pattern generation, aliases, spray passwords file, cooldown settings
    - Checkpoint: enable, select file, resume toggle
-   - Form & CSRF: auto-discover form, refresh CSRF each attempt
-   - Pre-login chain: enable, list URLs (comma), set per-attempt or per-worker, enable headless JS if needed
-4. Reporting panel shows live metrics; use Export buttons for JSON/CSV/HTML
-5. Logging: enable “Log to file” to capture attempt-level CSV (timestamp, user, pass, status, latency, success, lockout, proxy, UA)
+   - Form & CSRF: auto-discover form, refresh CSRF each attempt (HTTP)
+   - Pre-login chain: enable, list URLs (comma), set per-attempt or per-worker, enable headless JS if needed (HTTP)
+   - Fail-fast guard: stop or global backoff when error-rate exceeds threshold in a window
+   - FTP: TLS and Passive toggles
+4. Reporting panel shows live metrics; use Export buttons for JSON/CSV/HTML/MD/DOCX
+5. Logging: enable “Log to file” to capture attempt-level CSV (timestamp, user, pass, status, latency, success, lockout, error, proxy, UA)
 
 Notes:
 - Brute-force grows exponentially; prefer smart modes and spraying
 - Headless JS requires Playwright and installed browser binaries
 - Checkpoint applies to spraying; restarts resume from last password/username index
+- Evidence Bundle includes credentials.csv/txt, artifacts, HAR, screenshot, and report files
 
 ## Profiles
 
 - Save profiles to JSON using "Save Profile". Load them via "Load Profile"
 - Legacy .pkl profiles from older versions can still be loaded
+
+## Performance and stealth tips
+
+- Use Safe Mode caps conservatively (e.g., QPS ≤ 1, concurrency ≤ 2) for exam targets
+- Prefer Smart mutations and spraying over full brute-force
+- Enable fail-fast backoff to auto-throttle during transient spikes; 30–60s is a good backoff
+- HTTP: lower retries/backoff; enable proxy/UA rotation only where permitted; async off when using Flow
+- SSH/FTP: short timeouts (10–15s), small concurrency; avoid hammering; rely on global backoff
+- Use allowlists to avoid accidental out-of-scope traffic
+- Capture artifacts selectively (limit failures N) to reduce disk churn
 
 ## License
 

