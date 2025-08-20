@@ -72,6 +72,10 @@ class RateLimiter:
 		self._allowance = 1.0
 		self._last_check = time.monotonic()
 
+	def set_rate(self, qps: float) -> None:
+		with self.lock:
+			self.qps = max(0.1, float(qps))
+
 	def acquire(self) -> None:
 		# Token bucket to support fractional QPS with minimal CPU
 		while True:
@@ -303,6 +307,15 @@ class PasswordListGeneratorApp:
 		self.var_failfast_backoff_sec = tk.IntVar(value=30)
 		self._error_backoff_until = [0.0]
 		self._error_backoff_lock = threading.Lock()
+		# Adaptive rate controls
+		self.var_adaptive_enabled = tk.BooleanVar(value=False)
+		self.var_adaptive_window_sec = tk.IntVar(value=30)
+		self.var_adaptive_min_qps = tk.DoubleVar(value=0.2)
+		self.var_adaptive_max_qps = tk.DoubleVar(value=5.0)
+		self.var_adaptive_up_pct = tk.DoubleVar(value=10.0)
+		self.var_adaptive_down_pct = tk.DoubleVar(value=50.0)
+		self.var_ratesweep_enabled = tk.BooleanVar(value=False)
+		self.var_ratesweep_secs = tk.IntVar(value=20)
 
 	def _default_output_path(self) -> str:
 		timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
@@ -522,6 +535,17 @@ class PasswordListGeneratorApp:
 		ttk.Label(safe, text="Action").grid(row=row_safe, column=5, sticky="e", padx=4, pady=2)
 		ttk.Combobox(safe, textvariable=self.var_failfast_action, values=["stop","backoff"], width=10, state="readonly").grid(row=row_safe, column=6, sticky="w", padx=4, pady=2)
 		self._add_labeled_entry(safe, "Backoff(s)", self.var_failfast_backoff_sec, row=row_safe, col=7)
+		# Adaptive rate controls
+		row_safe += 1
+		ttk.Checkbutton(safe, text="Adaptive QPS", variable=self.var_adaptive_enabled).grid(row=row_safe, column=0, sticky="w", padx=4, pady=2)
+		self._add_labeled_entry(safe, "Window(s)", self.var_adaptive_window_sec, row=row_safe, col=1)
+		self._add_labeled_entry(safe, "Min QPS", self.var_adaptive_min_qps, row=row_safe, col=3)
+		self._add_labeled_entry(safe, "Max QPS", self.var_adaptive_max_qps, row=row_safe, col=5)
+		row_safe += 1
+		self._add_labeled_entry(safe, "Up %", self.var_adaptive_up_pct, row=row_safe, col=1)
+		self._add_labeled_entry(safe, "Down %", self.var_adaptive_down_pct, row=row_safe, col=3)
+		self._add_labeled_entry(safe, "Sweep(s)", self.var_ratesweep_secs, row=row_safe, col=5)
+		ttk.Checkbutton(safe, text="Rate sweep", variable=self.var_ratesweep_enabled).grid(row=row_safe, column=0, sticky="w", padx=4, pady=2)
 		# Reporting actions
 		actions = ttk.Frame(report)
 		actions.grid(row=row+1, column=0, columnspan=3, sticky="we", pady=(8,0))
@@ -4253,6 +4277,41 @@ class PasswordListGeneratorApp:
 		if not found_msg:
 			found_msg = f"FTP run finished. Attempts: {completed:,}. No success."
 		return completed, found_msg
+
+	def _adaptive_rate_update(self, limiter: RateLimiter, base_max_qps: float, update_interval_s: float = 3.0) -> None:
+		if not bool(self.var_adaptive_enabled.get()):
+			return
+		now = time.time()
+		if not hasattr(self, '_last_adapt_ts'):
+			self._last_adapt_ts = 0.0
+		if (now - self._last_adapt_ts) < update_interval_s:
+			return
+		self._last_adapt_ts = now
+		try:
+			window = int(self.var_adaptive_window_sec.get() or 30)
+			min_qps = float(self.var_adaptive_min_qps.get() or 0.2)
+			max_qps = float(self.var_adaptive_max_qps.get() or base_max_qps or 1.0)
+			up = float(self.var_adaptive_up_pct.get() or 10.0) / 100.0
+			down = float(self.var_adaptive_down_pct.get() or 50.0) / 100.0
+			with self.metrics_lock:
+				now2 = time.time()
+				ats = [t for t in self.metrics["attempt_timestamps"] if now2 - t <= window]
+				errs = [t for t in self.metrics["error_timestamps"] if now2 - t <= window]
+				attempts = len(ats)
+				errors = len(errs)
+			if attempts < 10:
+				return
+			rate = errors / attempts if attempts else 0.0
+			cur = float(getattr(limiter, 'qps', 1.0))
+			if rate >= 0.2:
+				new = max(min_qps, cur * max(0.1, 1.0 - down))
+			else:
+				new = min(max_qps, cur * (1.0 + up))
+			if abs(new - cur) / max(cur, 0.1) >= 0.05:
+				limiter.set_rate(new)
+				self.ui_queue.put(("log", f"[Adaptive] QPS -> {new:.2f}"))
+		except Exception:
+			return
 
 
 if __name__ == "__main__":
