@@ -4,13 +4,13 @@
     <SchemaVersion>2.0</SchemaVersion>
     <ProjectGuid>a80848d4-22b0-43cc-8031-42bf23c3488d</ProjectGuid>
     <ProjectHome>.</ProjectHome>
-    <StartupFile>SoupSalad.py</StartupFile>
+    <StartupFile>ForceCraft.py</StartupFile>
     <SearchPath>
     </SearchPath>
     <WorkingDirectory>.</WorkingDirectory>
     <OutputPath>.</OutputPath>
-    <Name>SoupSalad</Name>
-    <RootNamespace>SoupSalad</RootNamespace>
+    <Name>ForceCraft</Name>
+    <RootNamespace>ForceCraft</RootNamespace>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)' == 'Debug' ">
     <DebugSymbols>true</DebugSymbols>
@@ -21,7 +21,7 @@
     <EnableUnmanagedDebugging>false</EnableUnmanagedDebugging>
   </PropertyGroup>
   <ItemGroup>
-    <Compile Include="SoupSalad.py" />
+    <Compile Include="ForceCraft.py" />
   </ItemGroup>
   <Import Project="$(MSBuildExtensionsPath32)\Microsoft\VisualStudio\v$(VisualStudioVersion)\Python Tools\Microsoft.PythonTools.targets" />
   <!-- Uncomment the CoreCompile target to enable the Build command in
