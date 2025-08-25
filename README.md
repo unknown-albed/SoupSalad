@@ -1,4 +1,4 @@
-# SoupSalad
+# ForceCraft
 
 A modernized, GUI-based Password List Generator built with Python. Generate custom password dictionaries from profile data using either character brute-force or realistic smart mutations.
 
@@ -100,14 +100,14 @@ pip install playwright && playwright install chromium
 ## Run
 
 ```bash
-python SoupSalad.py
+python ForceCraft.py
 ```
 
 ## CLI automation
 
 - Multi-target from a file (HTTP/SSH/FTP depending on profile `protocol`):
 ```bash
-python SoupSalad.py \
+python ForceCraft.py \
   --profile myprofile.json \
   --targets-file targets.txt \
   --out-dir ./out \
@@ -118,7 +118,7 @@ python SoupSalad.py \
 
 - Nmap XML import (HTTP/HTTPS extraction):
 ```bash
-python SoupSalad.py \
+python ForceCraft.py \
   --profile http_profile.json \
   --nmap-xml scan.xml \
   --out-dir ./out \
@@ -128,7 +128,7 @@ python SoupSalad.py \
 
 - Single target (headless) with OSCP outputs and DOCX template:
 ```bash
-python SoupSalad.py \
+python ForceCraft.py \
   --profile profiles/oscp-safe-flow.json \
   --out-dir ./bundle \
   --report-md ./bundle/report.md \
@@ -137,7 +137,7 @@ python SoupSalad.py \
   --no-gui
 ```
 
-Environment alternative for template: set `DOCX_TEMPLATE` or `SOUPSALAD_DOCX_TEMPLATE`.
+Environment alternative for template: set `DOCX_TEMPLATE` or `FORCECRAFT_DOCX_TEMPLATE`.
 
 ## Usage (Pentest)
 

@@ -2967,7 +2967,7 @@ class PasswordListGeneratorApp:
 				"cache": {},
 				"timings": {"send": 0, "wait": a.get('latency_ms', 0), "receive": 0}
 			})
-		return {"log": {"version": "1.2", "creator": {"name": "SoupSalad", "version": "1.0"}, "entries": entries}}
+		return {"log": {"version": "1.2", "creator": {"name": "ForceCraft", "version": "1.0"}, "entries": entries}}
 
 	def _screenshot_target(self, url: str, out_path: str) -> None:
 		if not url:
